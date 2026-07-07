@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -e
+
+echo "🔍 Running pre-commit checks..."
+
+# Rust: format check
+echo "  cargo fmt --check"
+cargo fmt --check || {
+    echo "❌ cargo fmt failed. Run 'cargo fmt' to fix."
+    exit 1
+}
+
+# Rust: clippy
+echo "  cargo clippy"
+cargo clippy -- -D warnings 2>/dev/null || {
+    echo "❌ cargo clippy failed. Fix warnings above."
+    exit 1
+}
+
+# Frontend: eslint (only if frontend files changed)
+FRONTEND_CHANGED=$(git diff --cached --name-only -- frontend/ | head -1)
+if [ -n "$FRONTEND_CHANGED" ]; then
+    if [ -d "frontend/node_modules" ]; then
+        echo "  eslint (frontend)"
+        (cd frontend && ./node_modules/.bin/eslint --max-warnings 0 src/) || {
+            echo "❌ eslint failed. Run 'cd frontend && pnpm lint:fix' to fix."
+            exit 1
+        }
+    else
+        echo "  ⚠ frontend/node_modules not found, skipping eslint"
+    fi
+fi
+
+echo "✅ All checks passed."

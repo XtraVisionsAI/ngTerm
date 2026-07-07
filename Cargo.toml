@@ -1,0 +1,48 @@
+[package]
+name = "ngterm"
+version = "0.2.0"
+edition = "2021"
+description = "Web-based multi-server SSH terminal manager"
+license = "MIT"
+
+[lib]
+name = "ngterm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ngterm"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws", "multipart"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tokio = { version = "1", features = ["full"] }
+russh = "0.61"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+jsonwebtoken = "9"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+futures = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+async-trait = "0.1"
+rust-embed = "8"
+mime_guess = "2"
+hex = "0.4"
+nix = { version = "0.29", features = ["term", "signal", "process"] }
+libc = "0.2"
+russh-sftp = "2.3.0"
+tokio-util = { version = "0.7", features = ["io"] }
+pin-project-lite = "0.2"
