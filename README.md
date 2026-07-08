@@ -16,15 +16,27 @@
 
 ---
 
-NGTerm is a single-binary SSH gateway that sits on your jump host and provides browser-based terminal access to internal servers. SSH keys are encrypted at rest — the master key lives only in your head.
+NGTerm is a single-binary SSH gateway that sits on your jump host and provides browser-based terminal access to internal servers. SSH private keys are encrypted at rest and can only be unlocked by their owner's password.
+
+<!-- TODO: screenshots — terminal with split panes / agent chat / server management -->
+<!-- ![Terminal](docs/screenshots/terminal.png) -->
 
 ## Features
 
-- **Domain-Based Relay** — deploy on a gateway server, SSH into internal machines; users only need browser access to one endpoint
-- **Encrypted Key Storage** — SSH private keys stored with AES-256-GCM encryption in SQLite; decrypted in-memory only during active sessions
-- **Multi-Tab Terminal** — connect to multiple servers simultaneously with labeled tabs showing alias and IP
-- **Server & Key Management** — organize servers by domain groups, manage SSH keys with upload or paste
+- **Jump-Host Relay** — deploy on a gateway server, SSH into internal machines; users only need browser access to one endpoint
+- **Encrypted Key Storage** — per-user SSH keys encrypted with AES-256-GCM in SQLite; only the owner's password can unlock them, even the admin cannot
+- **Multi-Tab & Split Panes** — multiple servers in labeled tabs; split any terminal horizontally/vertically (Ctrl+Shift+D/E/W), layout survives page refresh
+- **AI Agent Integration** — launch CLI agents (e.g. Claude Code) against any session: streaming chat UI, tool-call rendering, and execution approval, auto-installed on the target over SSH
+- **File Explorer (SFTP)** — browse, upload, download, and edit remote files from the browser
+- **Git Panel** — status, log, branches, and diff for repositories on the remote machine
+- **Audit Logs** — connection and session history with filtering
+- **Admin Terminal** — local shell on the jump host for administrators, with the same split-pane experience
+- **Three-Level Tool Config** — admin defines AI tool templates; users and per-server settings override them; secrets encrypted per user
 - **Single Binary** — frontend embedded via rust-embed; one file to deploy, zero runtime dependencies
+
+## NGTerm EE
+
+The open-source edition integrates external CLI agents. **NGTerm EE** (enterprise edition) additionally ships a built-in agent engine that runs inside the server process — LLM-driven ReAct loop (Anthropic / OpenAI-compatible), server-side risk classification and command denylists, MCP tool servers, and reusable skills. The tool type selector in the admin UI includes a **"Native Engine"** option: it is part of the shared UI, and starting a native tool on the open-source backend returns *"Native engine tools require NGTerm EE"*. Everything else in this repository is fully functional standalone.
 
 ## Architecture
 
@@ -32,7 +44,7 @@ NGTerm is a single-binary SSH gateway that sits on your jump host and provides b
 Browser (Vue 3 + xterm.js)
     ↕ WebSocket / HTTPS
 NGTerm (Rust + Axum, on jump host)
-    ↕ SSH (russh)
+    ↕ SSH (russh)          ↘ spawns CLI agents (stream-json)
 Internal Servers
 ```
 
@@ -76,68 +88,36 @@ cargo build --release
 
 # Deploy
 scp target/release/ngterm user@server:~/
-ssh user@server './ngterm --port 8080'
+ssh user@server './ngterm --port 8080 --data-dir ~/.ngterm'
 ```
 
 ### First Use
 
-1. Visit `http://<host>:8080` after starting the service
-2. Register an account (set username, password, and Master Key)
-3. Add SSH keys (upload file or paste PEM content)
-4. Add domains and servers (associate keys)
-5. Click "Connect" on the terminal page
+1. Start the service — on first run a **master key** is generated and printed to the log (or provide one via `--master-key`). Save it; it is shown only once.
+2. Visit `http://<host>:8080` and sign in as **admin** with the master key.
+3. Create user accounts, server groups, and servers in the admin pages.
+4. Sign in as a **user**, add your SSH keys (upload or paste), and connect from the terminal page.
 
 ## Security Model
 
+Two roles with separated trust:
+
+- **Admin** authenticates with the master key and manages users/servers — but **cannot decrypt anyone's SSH keys**.
+- **User** keys are wrapped by a key derived from the user's own password:
+
 ```
-Master Key (user memory, never stored)
-    ↓ Argon2id + salt
-Encryption Key (in-memory, valid for session duration)
+user password + pepper (.env, SHA-256 of master key)
+    ↓ Argon2id
+wrapping key  →  unwraps user_secret (in-memory for the session)
     ↓ HKDF per key_id
-Data Encryption Key
+data encryption key
     ↓ AES-256-GCM
-Encrypted SSH private key (SQLite)
+encrypted SSH private key (SQLite)
 ```
 
-- Master Key is never written to disk — entered by user on every login
-- A stolen database cannot recover private keys
-- Decrypted SSH keys exist in memory only during connection setup, then zeroized
-- Always use HTTPS in production
-
-## Deployment
-
-- **EC2**: t3.small (2 vCPU, 2GB RAM) is sufficient for ≤10 servers / 3 users
-- **Security Group**: only expose 443 (HTTPS) + 22 (management SSH)
-- **Reverse Proxy**: nginx or Caddy in front for TLS termination
-- **systemd**: run as non-root user with restricted file permissions
-
-## Project Structure
-
-```
-ngterm/
-├── Cargo.toml
-├── build.rs                # Auto-builds frontend on release
-├── src/
-│   ├── main.rs             # Server startup
-│   ├── web.rs              # API routes + static file serving
-│   ├── ssh_bridge.rs       # russh SSH connection management
-│   ├── session_manager.rs  # Terminal session lifecycle
-│   ├── ws_handler.rs       # WebSocket ↔ SSH bidirectional relay
-│   ├── auth.rs             # Authentication + Master Key sessions
-│   ├── crypto.rs           # Encryption primitives
-│   ├── key_manager.rs      # SSH key CRUD
-│   ├── server_registry.rs  # Domain/Server CRUD
-│   ├── db.rs               # SQLite initialization
-│   └── config.rs           # Configuration
-└── frontend/
-    ├── package.json
-    ├── vite.config.ts
-    └── src/
-        ├── pages/          # Login, terminal, server mgmt, key mgmt
-        ├── components/     # terminal-view
-        ├── composables/    # useApi, useTerminal, useWebSocket
-        └── stores/         # auth, session, server
-```
+- A stolen database alone cannot recover private keys (pepper lives in `.env`, passwords live nowhere)
+- Decrypted keys exist in memory only while establishing connections, then are zeroized
+- Always front with HTTPS in production
 
 ## CLI Options
 
@@ -147,10 +127,17 @@ ngterm [OPTIONS]
 Options:
   -p, --port <PORT>              Listen port [default: 8080]
       --host <HOST>              Listen address [default: 0.0.0.0]
-      --data-dir <DIR>           Data directory [default: ~/.ngterm]
+      --data-dir <DIR>           Data directory (SQLite + .env) [default: .]
       --default-cols <COLS>      Default terminal columns [default: 120]
       --default-rows <ROWS>      Default terminal rows [default: 36]
+      --master-key <KEY>         Set master key on first run (ignored after init)
 ```
+
+## Deployment
+
+- **Sizing**: 2 vCPU / 2 GB RAM is sufficient for ≈10 servers / a handful of concurrent users
+- **Network**: only expose 443 (HTTPS) + 22 (management SSH); put nginx or Caddy in front for TLS
+- **systemd**: run as a non-root user; keep `--data-dir` on a restricted-permission path (it holds the SQLite DB and `.env`)
 
 ## License
 
