@@ -5,7 +5,7 @@
 <p align="center">
   <h1 align="center">NGTerm</h1>
   <p align="center">
-    Web-based multi-server SSH terminal manager — deploy on a jump host, manage internal servers from a browser.
+    Agentic web SSH terminal manager — manage internal servers from a browser, and let AI agents run operations on them for you.
   </p>
   <p align="center">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
@@ -16,17 +16,17 @@
 
 ---
 
-NGTerm is a single-binary SSH gateway that sits on your jump host and provides browser-based terminal access to internal servers. SSH private keys are encrypted at rest and can only be unlocked by their owner's password.
+NGTerm is a single-binary SSH gateway that sits on your jump host and provides browser-based terminal access to internal servers — with AI agents built into the workflow: open a session, hand it to an agent (e.g. Claude Code), watch every command it runs, and approve the risky ones. SSH private keys are encrypted at rest and can only be unlocked by their owner's password.
 
 <!-- TODO: screenshots — terminal with split panes / agent chat / server management -->
 <!-- ![Terminal](docs/screenshots/terminal.png) -->
 
 ## Features
 
+- **AI Agent Integration** — launch CLI agents (e.g. Claude Code) against any session: streaming chat UI, tool-call rendering, and execution approval, auto-installed on the target over SSH
 - **Jump-Host Relay** — deploy on a gateway server, SSH into internal machines; users only need browser access to one endpoint
 - **Encrypted Key Storage** — per-user SSH keys encrypted with AES-256-GCM in SQLite; only the owner's password can unlock them, even the admin cannot
 - **Multi-Tab & Split Panes** — multiple servers in labeled tabs; split any terminal horizontally/vertically (Ctrl+Shift+D/E/W), layout survives page refresh
-- **AI Agent Integration** — launch CLI agents (e.g. Claude Code) against any session: streaming chat UI, tool-call rendering, and execution approval, auto-installed on the target over SSH
 - **File Explorer (SFTP)** — browse, upload, download, and edit remote files from the browser
 - **Git Panel** — status, log, branches, and diff for repositories on the remote machine
 - **Audit Logs** — connection and session history with filtering

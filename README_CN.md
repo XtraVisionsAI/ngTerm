@@ -5,7 +5,7 @@
 <p align="center">
   <h1 align="center">NGTerm</h1>
   <p align="center">
-    Web SSH 多服务器终端管理平台 —— 部署在跳板机上，通过浏览器管理内网服务器。
+    具备 Agentic 能力的 Web SSH 终端管理平台 —— 浏览器管理内网服务器，让 AI Agent 替你执行运维操作。
   </p>
   <p align="center">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
@@ -16,17 +16,17 @@
 
 ---
 
-NGTerm 是一个单二进制 SSH 网关，部署在跳板机上，提供浏览器端的内网服务器终端访问。SSH 私钥加密存储，只有密钥所有者的密码才能解锁。
+NGTerm 是一个单二进制 SSH 网关，部署在跳板机上，提供浏览器端的内网服务器终端访问——并把 AI Agent 融入运维工作流：打开会话，交给 agent（如 Claude Code）执行，全程可见每条命令，危险操作需你审批。SSH 私钥加密存储，只有密钥所有者的密码才能解锁。
 
 <!-- TODO: 截图占位 —— 分屏终端 / agent 对话 / 服务器管理 -->
 <!-- ![Terminal](docs/screenshots/terminal.png) -->
 
 ## 功能特性
 
+- **AI Agent 集成** —— 对任意会话启动 CLI agent（如 Claude Code）：流式对话界面、工具调用渲染、执行审批，可通过 SSH 在目标机自动安装
 - **跳板机中继** —— 部署在网关服务器上向内网机器发起 SSH，用户只需能访问一个浏览器端点
 - **密钥加密存储** —— 每用户的 SSH 密钥以 AES-256-GCM 加密存入 SQLite，只有所有者本人的密码能解锁，管理员也不行
 - **多标签 + 分屏** —— 多服务器标签页；任意终端横/纵向分屏（Ctrl+Shift+D/E/W），布局在刷新后保持
-- **AI Agent 集成** —— 对任意会话启动 CLI agent（如 Claude Code）：流式对话界面、工具调用渲染、执行审批，可通过 SSH 在目标机自动安装
 - **文件管理器（SFTP）** —— 浏览器内浏览、上传、下载、编辑远程文件
 - **Git 面板** —— 远程仓库的 status / log / 分支 / diff
 - **审计日志** —— 连接与会话历史，支持筛选
