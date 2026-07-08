@@ -587,8 +587,7 @@
                       </div>
                       <div v-if="tool.result" class="border-t border-om-border px-2 py-1">
                         <pre class="max-h-40 overflow-auto whitespace-pre-wrap break-all text-xs text-om-dimmed"
-                          >{{ tool.result.slice(0, 2000) }}{{ tool.result.length > 2000 ? '...' : '' }}</pre
-                        >
+                          >{{ tool.result.slice(0, 2000) }}{{ tool.result.length > 2000 ? '...' : '' }}</pre>
                       </div>
                       <div v-else-if="!tool.result && tool.id" class="border-t border-om-border px-2 py-1">
                         <n-spin size="tiny" />
@@ -601,14 +600,12 @@
                           <div class="mb-1 text-om-primary">输入:</div>
                           <pre
                             class="overflow-x-auto whitespace-pre-wrap break-all rounded bg-om-bg p-2 text-om-success"
-                            >{{ tool.input }}</pre
-                          >
+                            >{{ tool.input }}</pre>
                           <template v-if="tool.result">
                             <div class="mb-1 mt-2 text-om-primary">结果:</div>
                             <pre class="overflow-x-auto whitespace-pre-wrap break-all rounded bg-om-bg p-2 text-om-text"
                               >{{ tool.result?.slice(0, 2000)
-                              }}{{ (tool.result?.length || 0) > 2000 ? '...' : '' }}</pre
-                            >
+                              }}{{ (tool.result?.length || 0) > 2000 ? '...' : '' }}</pre>
                           </template>
                           <div v-else class="mt-1">
                             <n-spin size="tiny" />
@@ -651,8 +648,7 @@
             <pre
               v-if="Object.keys(pendingApproval.input).length > 0"
               class="mb-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-om-bg p-2 text-xs text-om-success font-mono"
-              >{{ JSON.stringify(pendingApproval.input, null, 2) }}</pre
-            >
+              >{{ JSON.stringify(pendingApproval.input, null, 2) }}</pre>
             <div class="flex gap-2">
               <n-button size="small" type="success" @click="handleApproval(true)">允许</n-button>
               <n-button size="small" type="error" @click="handleApproval(false)">拒绝</n-button>

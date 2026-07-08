@@ -14,11 +14,15 @@ import type {
   ParamValueZeroOrMore,
   ParamValueZeroOrOne,
 } from 'vue-router'
+import type {
+  _ExtractParamParserType,
+} from 'vue-router/experimental'
 
 declare module 'vue-router' {
   interface TypesConfig {
-    ParamParsers:
-      | never
+    _ParamParsers: {}
+    RouteNamedMap: import('vue-router/auto-routes').RouteNamedMap
+    _RouteFileInfoMap: import('vue-router/auto-routes')._RouteFileInfoMap
   }
 }
 
@@ -108,11 +112,15 @@ declare module 'vue-router/auto-routes' {
         | '/'
       views:
         | never
+      pathParamNames:
+        | never
     }
     'src/pages/admin/index.vue': {
       routes:
         | '/admin/'
       views:
+        | never
+      pathParamNames:
         | never
     }
     'src/pages/admin/components/ToolFormModal.vue': {
@@ -120,11 +128,15 @@ declare module 'vue-router/auto-routes' {
         | '/admin/components/ToolFormModal'
       views:
         | never
+      pathParamNames:
+        | never
     }
     'src/pages/admin/terminal.vue': {
       routes:
         | '/admin/terminal'
       views:
+        | never
+      pathParamNames:
         | never
     }
     'src/pages/admin/tools.vue': {
@@ -132,11 +144,15 @@ declare module 'vue-router/auto-routes' {
         | '/admin/tools'
       views:
         | never
+      pathParamNames:
+        | never
     }
     'src/pages/admin/users.vue': {
       routes:
         | '/admin/users'
       views:
+        | never
+      pathParamNames:
         | never
     }
     'src/pages/audit/index.vue': {
@@ -144,17 +160,23 @@ declare module 'vue-router/auto-routes' {
         | '/audit/'
       views:
         | never
+      pathParamNames:
+        | never
     }
     'src/pages/login.vue': {
       routes:
         | '/login'
       views:
         | never
+      pathParamNames:
+        | never
     }
     'src/pages/tools/index.vue': {
       routes:
         | '/tools/'
       views:
+        | never
+      pathParamNames:
         | never
     }
   }
