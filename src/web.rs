@@ -203,13 +203,19 @@ async fn handle_login(
             .into_response();
     }
 
-    match auth::login(
-        &state.db,
-        &req.username,
-        &req.password,
-        &state.config.pepper,
-        &state.config.jwt_secret,
-    ) {
+    let login_state = state.clone();
+    let (username, password) = (req.username.clone(), req.password.clone());
+    let result = auth::run_blocking(move || {
+        auth::login(
+            &login_state.db,
+            &username,
+            &password,
+            &login_state.config.pepper,
+            &login_state.config.jwt_secret,
+        )
+    })
+    .await;
+    match result {
         Ok((token, user_id, user_secret)) => {
             state.rate_limiter.reset(ip);
             state
@@ -336,13 +342,19 @@ async fn handle_change_password(
         None => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
-    match auth::change_password(
-        &state.db,
-        &user_id,
-        &req.old_password,
-        &req.new_password,
-        &state.config.pepper,
-    ) {
+    let cp_state = state.clone();
+    let uid = user_id.clone();
+    let result = auth::run_blocking(move || {
+        auth::change_password(
+            &cp_state.db,
+            &uid,
+            &req.old_password,
+            &req.new_password,
+            &cp_state.config.pepper,
+        )
+    })
+    .await;
+    match result {
         Ok(()) => {
             state.auth_sessions.write().await.remove(&user_id);
             Json(serde_json::json!({"message": "Password changed. Please login again."}))
@@ -391,7 +403,13 @@ async fn handle_create_user(
         let bytes: [u8; 8] = crypto::generate_random_bytes();
         hex::encode(bytes)
     });
-    match auth::create_user(&state.db, &req.username, &password, &state.config.pepper) {
+    let cu_state = state.clone();
+    let username = req.username.clone();
+    let result = auth::run_blocking(move || {
+        auth::create_user(&cu_state.db, &username, &password, &cu_state.config.pepper)
+    })
+    .await;
+    match result {
         Ok((user_id, pwd)) => (
             StatusCode::CREATED,
             Json(serde_json::json!({"userId": user_id, "username": req.username, "password": pwd})),
@@ -429,7 +447,18 @@ async fn handle_reset_user_password(
     _admin: AdminUser,
     Json(req): Json<ResetPasswordRequest>,
 ) -> impl IntoResponse {
-    match auth::admin_reset_password(&state.db, &id, &req.new_password, &state.config.pepper) {
+    let rp_state = state.clone();
+    let uid = id.clone();
+    let result = auth::run_blocking(move || {
+        auth::admin_reset_password(
+            &rp_state.db,
+            &uid,
+            &req.new_password,
+            &rp_state.config.pepper,
+        )
+    })
+    .await;
+    match result {
         Ok(()) => {
             state.auth_sessions.write().await.remove(&id);
             Json(serde_json::json!({"message": "Password reset. User's SSH keys have been cleared."}))

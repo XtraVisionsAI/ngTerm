@@ -195,7 +195,48 @@ pub fn create_user(
     Ok((user_id, default_password.to_string()))
 }
 
-/// User login: verify password, unwrap user_secret
+/// Run a CPU-heavy or lock-holding credential operation off the async
+/// runtime. Argon2 takes tens of milliseconds per call; doing it inline
+/// would stall every other connection sharing the worker thread.
+pub async fn run_blocking<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(format!("credential task failed: {}", e)))
+}
+
+/// Freshly derived password hash and wrapped user secret, computed without
+/// holding the database lock.
+struct Credentials {
+    password_hash: String,
+    kdf_salt: [u8; 16],
+    encrypted_secret: Vec<u8>,
+    secret_nonce: [u8; 12],
+}
+
+fn derive_credentials(
+    password: &str,
+    user_secret: &[u8; 32],
+    pepper: &str,
+) -> Result<Credentials, String> {
+    let password_hash = crypto::hash_password(password).map_err(|e| e.to_string())?;
+    let kdf_salt = crypto::generate_salt();
+    let wrapping_key = crypto::derive_wrapping_key(password, &kdf_salt, pepper);
+    let (encrypted_secret, secret_nonce) =
+        crypto::wrap_secret(&wrapping_key, user_secret).map_err(|e| e.to_string())?;
+    Ok(Credentials {
+        password_hash,
+        kdf_salt,
+        encrypted_secret,
+        secret_nonce,
+    })
+}
+
+/// User login: verify password, unwrap user_secret. The database lock is
+/// held only for the row lookup, never across the KDF.
 pub fn login(
     db: &Database,
     username: &str,
@@ -203,15 +244,14 @@ pub fn login(
     pepper: &str,
     jwt_secret: &[u8],
 ) -> Result<(String, String, [u8; 32]), String> {
-    let conn = db.conn();
-
     let (user_id, password_hash, kdf_salt, encrypted_secret, secret_nonce): (
         String,
         String,
         Vec<u8>,
         Vec<u8>,
         Vec<u8>,
-    ) = conn
+    ) = db
+        .conn()
         .query_row(
             "SELECT id, password, kdf_salt, encrypted_secret, secret_nonce FROM users WHERE username = ?1",
             rusqlite::params![username],
@@ -243,14 +283,13 @@ pub fn change_password(
     new_password: &str,
     pepper: &str,
 ) -> Result<(), String> {
-    let conn = db.conn();
-
     let (password_hash, kdf_salt, encrypted_secret, secret_nonce): (
         String,
         Vec<u8>,
         Vec<u8>,
         Vec<u8>,
-    ) = conn
+    ) = db
+        .conn()
         .query_row(
             "SELECT password, kdf_salt, encrypted_secret, secret_nonce FROM users WHERE id = ?1",
             rusqlite::params![user_id],
@@ -269,10 +308,8 @@ pub fn change_password(
     let user_secret = crypto::unwrap_secret(&old_wrapping_key, &encrypted_secret, &nonce)
         .map_err(|_| "Failed to decrypt secret".to_string())?;
 
-    // Reuse the connection already held: `db.conn()` is not re-entrant.
-    store_credentials(&conn, user_id, new_password, &user_secret, pepper)?;
-
-    Ok(())
+    let creds = derive_credentials(new_password, &user_secret, pepper)?;
+    store_credentials(&db.conn(), user_id, &creds)
 }
 
 /// Admin reset password: generates new secret, clears user's SSH keys
@@ -283,8 +320,10 @@ pub fn admin_reset_password(
     pepper: &str,
 ) -> Result<(), String> {
     let new_user_secret = crypto::generate_user_secret();
+    let creds = derive_credentials(new_password, &new_user_secret, pepper)?;
+
     let conn = db.conn();
-    store_credentials(&conn, user_id, new_password, &new_user_secret, pepper)?;
+    store_credentials(&conn, user_id, &creds)?;
 
     // Clear all SSH keys for this user (old secret can't decrypt them anymore)
     conn.execute(
@@ -299,20 +338,12 @@ pub fn admin_reset_password(
 fn store_credentials(
     conn: &rusqlite::Connection,
     user_id: &str,
-    password: &str,
-    user_secret: &[u8; 32],
-    pepper: &str,
+    creds: &Credentials,
 ) -> Result<(), String> {
-    let password_hash = crypto::hash_password(password).map_err(|e| e.to_string())?;
-    let kdf_salt = crypto::generate_salt();
-    let wrapping_key = crypto::derive_wrapping_key(password, &kdf_salt, pepper);
-    let (encrypted_secret, nonce) =
-        crypto::wrap_secret(&wrapping_key, user_secret).map_err(|e| e.to_string())?;
-
     conn
         .execute(
             "UPDATE users SET password = ?1, kdf_salt = ?2, encrypted_secret = ?3, secret_nonce = ?4 WHERE id = ?5",
-            rusqlite::params![password_hash, kdf_salt.as_slice(), encrypted_secret, nonce.as_slice(), user_id],
+            rusqlite::params![creds.password_hash, creds.kdf_salt.as_slice(), creds.encrypted_secret, creds.secret_nonce.as_slice(), user_id],
         )
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -362,8 +393,12 @@ pub fn rotate_secret(
         .map_err(|e| e.to_string())?;
     }
 
-    // Re-wrap new secret with password
-    let (kdf_salt,): (Vec<u8>,) = conn
+    drop(stmt);
+    drop(conn);
+
+    // Re-wrap new secret with password (KDF runs without the DB lock).
+    let (kdf_salt,): (Vec<u8>,) = db
+        .conn()
         .query_row(
             "SELECT kdf_salt FROM users WHERE id = ?1",
             rusqlite::params![user_id],
@@ -375,11 +410,12 @@ pub fn rotate_secret(
     let (new_encrypted_secret, new_nonce) =
         crypto::wrap_secret(&wrapping_key, &new_user_secret).map_err(|e| e.to_string())?;
 
-    conn.execute(
-        "UPDATE users SET encrypted_secret = ?1, secret_nonce = ?2 WHERE id = ?3",
-        rusqlite::params![new_encrypted_secret, new_nonce.as_slice(), user_id],
-    )
-    .map_err(|e| e.to_string())?;
+    db.conn()
+        .execute(
+            "UPDATE users SET encrypted_secret = ?1, secret_nonce = ?2 WHERE id = ?3",
+            rusqlite::params![new_encrypted_secret, new_nonce.as_slice(), user_id],
+        )
+        .map_err(|e| e.to_string())?;
 
     Ok(new_user_secret)
 }
@@ -453,4 +489,122 @@ pub fn delete_user(db: &Database, user_id: &str) -> Result<bool, String> {
         )
         .map_err(|e| e.to_string())?;
     Ok(affected > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn temp_db() -> (Arc<Database>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ngterm-auth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Database::open(dir.to_str().unwrap()).unwrap();
+        (Arc::new(db), dir)
+    }
+
+    /// Measures how long the runtime's single worker was unable to service a
+    /// 1ms timer while `work` ran. On a current-thread runtime a CPU-bound
+    /// inline KDF shows up as one stall of roughly the KDF's duration; work
+    /// moved to the blocking pool must leave the timer essentially unaffected.
+    async fn max_probe_lag<F: std::future::Future>(work: F) -> (Duration, F::Output) {
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let probe = tokio::spawn(async move {
+            let mut worst = Duration::ZERO;
+            let mut last = Instant::now();
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                        let now = Instant::now();
+                        worst = worst.max(now - last);
+                        last = now;
+                    }
+                    _ = &mut stop_rx => break worst,
+                }
+            }
+        });
+        // Let the probe take its first timestamp, and let it observe the
+        // gap after the work finished before stopping it.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let out = work.await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let _ = stop_tx.send(());
+        (probe.await.unwrap(), out)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_kdf_runs_off_the_async_worker() {
+        let (db, dir) = temp_db();
+        let pepper = "pepper";
+        create_user(&db, "alice", "correct horse", pepper).unwrap();
+
+        // Baseline: one login (verify + derive) run inline, timed.
+        let started = Instant::now();
+        login(&db, "alice", "correct horse", pepper, b"jwt").unwrap();
+        let kdf_cost = started.elapsed();
+
+        // Before: inline KDF freezes the worker for the whole KDF.
+        let (inline_lag, res) =
+            max_probe_lag(async { login(&db, "alice", "correct horse", pepper, b"jwt") }).await;
+        assert!(res.is_ok());
+        assert!(
+            inline_lag >= kdf_cost / 2,
+            "inline KDF should stall the worker (lag {:?}, kdf {:?})",
+            inline_lag,
+            kdf_cost
+        );
+
+        // After: several concurrent logins through the blocking pool keep
+        // the worker responsive.
+        let (pooled_lag, results) = max_probe_lag(async {
+            let mut handles = Vec::new();
+            for _ in 0..4 {
+                let db = db.clone();
+                handles.push(tokio::spawn(async move {
+                    run_blocking(move || login(&db, "alice", "correct horse", pepper, b"jwt")).await
+                }));
+            }
+            let mut out = Vec::new();
+            for h in handles {
+                out.push(h.await.unwrap());
+            }
+            out
+        })
+        .await;
+        assert!(results.iter().all(|r| r.is_ok()), "{:?}", results);
+        let budget = std::cmp::max(Duration::from_millis(20), kdf_cost / 4);
+        assert!(
+            pooled_lag < budget,
+            "blocking-pool KDF must not stall the worker (lag {:?}, kdf {:?})",
+            pooled_lag,
+            kdf_cost
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn credential_changes_do_not_hold_the_db_lock_across_the_kdf() {
+        let (db, dir) = temp_db();
+        let pepper = "pepper";
+        let (uid, _) = create_user(&db, "bob", "old-pass", pepper).unwrap();
+
+        change_password(&db, &uid, "old-pass", "new-pass", pepper).unwrap();
+        assert!(login(&db, "bob", "old-pass", pepper, b"jwt").is_err());
+        let (_, _, secret_after_change) = login(&db, "bob", "new-pass", pepper, b"jwt").unwrap();
+
+        admin_reset_password(&db, &uid, "reset-pass", pepper).unwrap();
+        let (_, _, secret_after_reset) = login(&db, "bob", "reset-pass", pepper, b"jwt").unwrap();
+        assert_ne!(
+            secret_after_change, secret_after_reset,
+            "reset must mint a new secret"
+        );
+
+        let rotated = rotate_secret(&db, &uid, &secret_after_reset, "reset-pass", pepper).unwrap();
+        let (_, _, secret_after_rotate) = login(&db, "bob", "reset-pass", pepper, b"jwt").unwrap();
+        assert_eq!(rotated, secret_after_rotate);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

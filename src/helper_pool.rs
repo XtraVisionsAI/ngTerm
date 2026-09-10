@@ -60,96 +60,82 @@ impl AsyncWrite for WritableFile {
     }
 }
 
+/// One SSH connection shared by everything that operates on a session
+/// (terminal helpers, SFTP, agent shells). Channel opens are performed under
+/// the connection's own lock; waiting for command output happens outside it,
+/// so a long-running command on one session never blocks another session and
+/// several commands can be in flight on the same connection.
 pub struct HelperConnection {
     handle: client::Handle<SshClient>,
-    sftp: Option<SftpBridge>,
-    users: u32,
+    sftp: Option<Arc<SftpBridge>>,
+}
+
+/// Read every message of an exec channel until it closes.
+async fn drain_exec_channel(
+    mut channel: russh::Channel<client::Msg>,
+) -> (Vec<u8>, Vec<u8>, Option<u32>) {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_code: Option<u32> = None;
+    loop {
+        match channel.wait().await {
+            Some(russh::ChannelMsg::Data { data }) => stdout.extend_from_slice(&data),
+            Some(russh::ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                stderr.extend_from_slice(&data)
+            }
+            Some(russh::ChannelMsg::ExitStatus { exit_status }) => exit_code = Some(exit_status),
+            Some(russh::ChannelMsg::Eof) => {}
+            Some(russh::ChannelMsg::Close) | None => break,
+            _ => {}
+        }
+    }
+    (stdout, stderr, exit_code)
 }
 
 impl HelperConnection {
-    pub async fn exec(&mut self, command: &str) -> Result<String, String> {
+    async fn ensure_sftp(&mut self) -> Result<Arc<SftpBridge>, String> {
+        if let Some(sftp) = &self.sftp {
+            return Ok(sftp.clone());
+        }
         let channel = self
             .handle
             .channel_open_session()
             .await
-            .map_err(|e| format!("Channel open failed: {}", e))?;
+            .map_err(|e| format!("SFTP channel open failed: {}", e))?;
 
         channel
-            .exec(true, command)
+            .request_subsystem(true, "sftp")
             .await
-            .map_err(|e| format!("Exec failed: {}", e))?;
+            .map_err(|e| format!("SFTP subsystem request failed: {}", e))?;
 
-        let mut output = Vec::new();
-        let mut channel = channel;
-        loop {
-            match channel.wait().await {
-                Some(russh::ChannelMsg::Data { data }) => {
-                    output.extend_from_slice(&data);
-                }
-                Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close) | None => {
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        String::from_utf8(output).map_err(|e| format!("Invalid UTF-8 output: {}", e))
-    }
-
-    pub async fn exec_binary(&mut self, command: &str) -> Result<Vec<u8>, String> {
-        let channel = self
-            .handle
-            .channel_open_session()
+        let sftp_session = russh_sftp::client::SftpSession::new(channel.into_stream())
             .await
-            .map_err(|e| format!("Channel open failed: {}", e))?;
+            .map_err(|e| format!("SFTP session init failed: {}", e))?;
 
-        channel
-            .exec(true, command)
-            .await
-            .map_err(|e| format!("Exec failed: {}", e))?;
-
-        let mut output = Vec::new();
-        let mut channel = channel;
-        loop {
-            match channel.wait().await {
-                Some(russh::ChannelMsg::Data { data }) => {
-                    output.extend_from_slice(&data);
-                }
-                Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close) | None => {
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        Ok(output)
-    }
-
-    async fn ensure_sftp(&mut self) -> Result<&SftpBridge, String> {
-        if self.sftp.is_none() {
-            let channel = self
-                .handle
-                .channel_open_session()
-                .await
-                .map_err(|e| format!("SFTP channel open failed: {}", e))?;
-
-            channel
-                .request_subsystem(true, "sftp")
-                .await
-                .map_err(|e| format!("SFTP subsystem request failed: {}", e))?;
-
-            let sftp_session = russh_sftp::client::SftpSession::new(channel.into_stream())
-                .await
-                .map_err(|e| format!("SFTP session init failed: {}", e))?;
-
-            self.sftp = Some(SftpBridge::new(sftp_session));
-        }
-        Ok(self.sftp.as_ref().unwrap())
+        let sftp = Arc::new(SftpBridge::new(sftp_session));
+        self.sftp = Some(sftp.clone());
+        Ok(sftp)
     }
 }
 
+enum ChannelKind<'a> {
+    Shell,
+    Exec(&'a [u8]),
+}
+
+struct Slot {
+    conn: Arc<Mutex<HelperConnection>>,
+    users: u32,
+}
+
+/// Registry of helper SSH connections keyed by terminal session id.
+///
+/// The map lock is only ever held for bookkeeping; every network operation
+/// (connecting, opening channels, SFTP calls, waiting for output) runs with
+/// at most the per-connection lock held, so a slow or unreachable server
+/// cannot stall unrelated sessions.
 pub struct HelperPool {
-    connections: Mutex<HashMap<String, HelperConnection>>,
+    connections: Mutex<HashMap<String, Slot>>,
     local_sessions: Mutex<HashSet<String>>,
 }
 
@@ -165,6 +151,8 @@ impl Default for HelperPool {
         Self::new()
     }
 }
+
+const NOT_FOUND: &str = "Helper connection not found";
 
 impl HelperPool {
     pub fn new() -> Self {
@@ -185,58 +173,103 @@ impl HelperPool {
         self.local_sessions.lock().await.contains(session_id)
     }
 
-    pub async fn open_shell_channel(
+    /// Look up the connection for a session, holding the map lock only for
+    /// the lookup itself.
+    async fn connection(&self, session_id: &str) -> Result<Arc<Mutex<HelperConnection>>, String> {
+        self.connections
+            .lock()
+            .await
+            .get(session_id)
+            .map(|slot| slot.conn.clone())
+            .ok_or_else(|| NOT_FOUND.to_string())
+    }
+
+    /// Open a channel of the given kind. The connection lock is released as
+    /// soon as the channel exists.
+    async fn open_channel(
         &self,
         session_id: &str,
+        kind: ChannelKind<'_>,
     ) -> Result<russh::Channel<client::Msg>, String> {
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-
-        let channel = conn
+        let conn = self.connection(session_id).await?;
+        let guard = conn.lock().await;
+        let channel = guard
             .handle
             .channel_open_session()
             .await
             .map_err(|e| format!("Channel open failed: {}", e))?;
-
-        channel
-            .request_shell(false)
-            .await
-            .map_err(|e| format!("Shell request failed: {}", e))?;
-
+        match kind {
+            ChannelKind::Shell => channel
+                .request_shell(false)
+                .await
+                .map_err(|e| format!("Shell request failed: {}", e))?,
+            ChannelKind::Exec(command) => channel
+                .exec(true, command)
+                .await
+                .map_err(|e| format!("Exec failed: {}", e))?,
+        }
         Ok(channel)
+    }
+
+    async fn sftp(&self, session_id: &str) -> Result<Arc<SftpBridge>, String> {
+        let conn = self.connection(session_id).await?;
+        let mut guard = conn.lock().await;
+        guard.ensure_sftp().await
+    }
+
+    pub async fn open_shell_channel(
+        &self,
+        session_id: &str,
+    ) -> Result<russh::Channel<client::Msg>, String> {
+        self.open_channel(session_id, ChannelKind::Shell).await
+    }
+
+    fn insert_if_absent(
+        conns: &mut HashMap<String, Slot>,
+        session_id: &str,
+        handle: client::Handle<SshClient>,
+    ) -> Option<client::Handle<SshClient>> {
+        if conns.contains_key(session_id) {
+            return Some(handle);
+        }
+        conns.insert(
+            session_id.to_string(),
+            Slot {
+                conn: Arc::new(Mutex::new(HelperConnection { handle, sftp: None })),
+                users: 1,
+            },
+        );
+        None
     }
 
     pub async fn register_handle(&self, session_id: &str, handle: client::Handle<SshClient>) {
         let mut conns = self.connections.lock().await;
-        if !conns.contains_key(session_id) {
-            conns.insert(
-                session_id.to_string(),
-                HelperConnection {
-                    handle,
-                    sftp: None,
-                    users: 1,
-                },
-            );
+        if let Some(extra) = Self::insert_if_absent(&mut conns, session_id, handle) {
+            drop(conns);
+            let _ = extra
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
         }
     }
 
+    /// Ensure a helper connection exists for the session. The SSH handshake
+    /// runs without holding the map lock; if another caller won the race the
+    /// redundant connection is closed again.
     pub async fn get_or_connect(&self, session_id: &str, info: &ConnectInfo) -> Result<(), String> {
-        let mut conns = self.connections.lock().await;
-        if conns.contains_key(session_id) {
+        if self.connections.lock().await.contains_key(session_id) {
             return Ok(());
         }
 
         let handle = Self::create_connection(info).await?;
-        conns.insert(
-            session_id.to_string(),
-            HelperConnection {
-                handle,
-                sftp: None,
-                users: 1,
-            },
-        );
+        let extra = {
+            let mut conns = self.connections.lock().await;
+            Self::insert_if_absent(&mut conns, session_id, handle)
+        };
+        if let Some(extra) = extra {
+            let _ = extra
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
+        }
         Ok(())
     }
 
@@ -244,43 +277,55 @@ impl HelperPool {
         if self.is_local(session_id).await {
             return Self::exec_local(command).await;
         }
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-        conn.exec(command).await
+        let channel = self
+            .open_channel(session_id, ChannelKind::Exec(command.as_bytes()))
+            .await?;
+        let (stdout, _, _) = drain_exec_channel(channel).await;
+        String::from_utf8(stdout).map_err(|e| format!("Invalid UTF-8 output: {}", e))
     }
 
     pub async fn exec_binary(&self, session_id: &str, command: &str) -> Result<Vec<u8>, String> {
         if self.is_local(session_id).await {
             return Self::exec_local(command).await.map(|s| s.into_bytes());
         }
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-        conn.exec_binary(command).await
+        let channel = self
+            .open_channel(session_id, ChannelKind::Exec(command.as_bytes()))
+            .await?;
+        let (stdout, _, _) = drain_exec_channel(channel).await;
+        Ok(stdout)
     }
 
     pub async fn remove(&self, session_id: &str) {
-        let mut conns = self.connections.lock().await;
-        if let Some(conn) = conns.get_mut(session_id) {
-            conn.users = conn.users.saturating_sub(1);
-            if conn.users == 0 {
-                let conn = conns.remove(session_id).unwrap();
-                let _ = conn
-                    .handle
-                    .disconnect(russh::Disconnect::ByApplication, "", "en")
-                    .await;
+        let to_close = {
+            let mut conns = self.connections.lock().await;
+            match conns.get_mut(session_id) {
+                Some(slot) => {
+                    slot.users = slot.users.saturating_sub(1);
+                    if slot.users == 0 {
+                        conns.remove(session_id).map(|slot| slot.conn)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
             }
-        }
+        };
         self.local_sessions.lock().await.remove(session_id);
+
+        if let Some(conn) = to_close {
+            // Waits only for in-flight channel opens on this very connection.
+            let guard = conn.lock().await;
+            let _ = guard
+                .handle
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
+        }
     }
 
     pub async fn add_user(&self, session_id: &str) {
         let mut conns = self.connections.lock().await;
-        if let Some(conn) = conns.get_mut(session_id) {
-            conn.users += 1;
+        if let Some(slot) = conns.get_mut(session_id) {
+            slot.users += 1;
         }
     }
 
@@ -304,41 +349,12 @@ impl HelperPool {
             let code = output.status.code().unwrap_or(1) as u32;
             return Ok((stdout, code));
         }
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-
-        let channel = conn
-            .handle
-            .channel_open_session()
-            .await
-            .map_err(|e| format!("Channel open failed: {}", e))?;
 
         let wrapped = format!("$SHELL -lic {}", crate::utils::shell_escape(command));
-        channel
-            .exec(true, wrapped.as_bytes())
-            .await
-            .map_err(|e| format!("Exec failed: {}", e))?;
-
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut exit_code: Option<u32> = None;
-        let mut channel = channel;
-        loop {
-            match channel.wait().await {
-                Some(russh::ChannelMsg::Data { data }) => stdout.extend_from_slice(&data),
-                Some(russh::ChannelMsg::ExtendedData { data, ext: 1 }) => {
-                    stderr.extend_from_slice(&data)
-                }
-                Some(russh::ChannelMsg::ExitStatus { exit_status }) => {
-                    exit_code = Some(exit_status)
-                }
-                Some(russh::ChannelMsg::Eof) => {}
-                Some(russh::ChannelMsg::Close) | None => break,
-                _ => {}
-            }
-        }
+        let channel = self
+            .open_channel(session_id, ChannelKind::Exec(wrapped.as_bytes()))
+            .await?;
+        let (stdout, stderr, exit_code) = drain_exec_channel(channel).await;
 
         let output = if stdout.is_empty() {
             String::from_utf8_lossy(&stderr).to_string()
@@ -354,23 +370,8 @@ impl HelperPool {
         session_id: &str,
         command: &str,
     ) -> Result<russh::Channel<client::Msg>, String> {
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-
-        let channel = conn
-            .handle
-            .channel_open_session()
+        self.open_channel(session_id, ChannelKind::Exec(command.as_bytes()))
             .await
-            .map_err(|e| format!("Agent channel open failed: {}", e))?;
-
-        channel
-            .exec(true, command.as_bytes())
-            .await
-            .map_err(|e| format!("Agent exec failed: {}", e))?;
-
-        Ok(channel)
     }
 
     // --- SFTP operations ---
@@ -379,24 +380,14 @@ impl HelperPool {
         if self.is_local(session_id).await {
             return local_fs::list_dir(path).await;
         }
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-        let sftp = conn.ensure_sftp().await?;
-        sftp.list_dir(path).await
+        self.sftp(session_id).await?.list_dir(path).await
     }
 
     pub async fn sftp_read(&self, session_id: &str, path: &str) -> Result<Vec<u8>, String> {
         if self.is_local(session_id).await {
             return local_fs::read_file(path).await;
         }
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-        let sftp = conn.ensure_sftp().await?;
-        sftp.read_file(path).await
+        self.sftp(session_id).await?.read_file(path).await
     }
 
     pub async fn sftp_write(
@@ -408,72 +399,42 @@ impl HelperPool {
         if self.is_local(session_id).await {
             return local_fs::write_file(path, data).await;
         }
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-        let sftp = conn.ensure_sftp().await?;
-        sftp.write_file(path, data).await
+        self.sftp(session_id).await?.write_file(path, data).await
     }
 
     pub async fn sftp_delete(&self, session_id: &str, path: &str) -> Result<(), String> {
         if self.is_local(session_id).await {
             return local_fs::delete(path).await;
         }
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-        let sftp = conn.ensure_sftp().await?;
-        sftp.delete(path).await
+        self.sftp(session_id).await?.delete(path).await
     }
 
     pub async fn sftp_mkdir(&self, session_id: &str, path: &str) -> Result<(), String> {
         if self.is_local(session_id).await {
             return local_fs::mkdir(path).await;
         }
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-        let sftp = conn.ensure_sftp().await?;
-        sftp.mkdir(path).await
+        self.sftp(session_id).await?.mkdir(path).await
     }
 
     pub async fn sftp_rename(&self, session_id: &str, from: &str, to: &str) -> Result<(), String> {
         if self.is_local(session_id).await {
             return local_fs::rename(from, to).await;
         }
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-        let sftp = conn.ensure_sftp().await?;
-        sftp.rename(from, to).await
+        self.sftp(session_id).await?.rename(from, to).await
     }
 
     pub async fn sftp_stat(&self, session_id: &str, path: &str) -> Result<FileEntry, String> {
         if self.is_local(session_id).await {
             return local_fs::stat(path).await;
         }
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-        let sftp = conn.ensure_sftp().await?;
-        sftp.stat(path).await
+        self.sftp(session_id).await?.stat(path).await
     }
 
     pub async fn sftp_realpath(&self, session_id: &str, path: &str) -> Result<String, String> {
         if self.is_local(session_id).await {
             return local_fs::realpath(path).await;
         }
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-        let sftp = conn.ensure_sftp().await?;
-        sftp.realpath(path).await
+        self.sftp(session_id).await?.realpath(path).await
     }
 
     pub async fn open_read(&self, session_id: &str, path: &str) -> Result<ReadableFile, String> {
@@ -484,12 +445,7 @@ impl HelperPool {
                 .map_err(|e| format!("open file failed: {}", e))?;
             return Ok(ReadableFile::Local(file));
         }
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-        let sftp = conn.ensure_sftp().await?;
-        let file = sftp.open_for_read(path).await?;
+        let file = self.sftp(session_id).await?.open_for_read(path).await?;
         Ok(ReadableFile::Sftp(file))
     }
 
@@ -501,12 +457,7 @@ impl HelperPool {
                 .map_err(|e| format!("create file failed: {}", e))?;
             return Ok(WritableFile::Local(file));
         }
-        let mut conns = self.connections.lock().await;
-        let conn = conns
-            .get_mut(session_id)
-            .ok_or_else(|| "Helper connection not found".to_string())?;
-        let sftp = conn.ensure_sftp().await?;
-        let file = sftp.open_for_write(path).await?;
+        let file = self.sftp(session_id).await?.open_for_write(path).await?;
         Ok(WritableFile::Sftp(file))
     }
 
@@ -548,6 +499,67 @@ impl HelperPool {
         }
 
         Ok(handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A TCP listener that accepts and then never speaks: the SSH handshake
+    /// against it hangs until the client gives up.
+    async fn silent_listener() -> (tokio::net::TcpListener, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, port)
+    }
+
+    #[tokio::test]
+    async fn slow_connect_does_not_block_other_sessions() {
+        let (listener, port) = silent_listener().await;
+        let accept = tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let pool = Arc::new(HelperPool::new());
+        let slow_pool = pool.clone();
+        let slow = tokio::spawn(async move {
+            let info = ConnectInfo {
+                host: "127.0.0.1".into(),
+                port,
+                username: "nobody".into(),
+                private_key_pem: String::new(),
+            };
+            slow_pool.get_or_connect("slow", &info).await
+        });
+
+        // Give the slow connect time to reach the (hanging) handshake.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !slow.is_finished(),
+            "handshake against a silent peer must still be pending"
+        );
+
+        // Unrelated session bookkeeping and lookups must not wait for it.
+        let unrelated = async {
+            pool.register_local("local").await;
+            assert!(pool.is_local("local").await);
+            let (out, code) = pool.exec_with_status("local", "echo ok").await.unwrap();
+            assert_eq!(out.trim(), "ok");
+            assert_eq!(code, 0);
+            let err = pool.open_shell_channel("other").await.unwrap_err();
+            assert_eq!(err, NOT_FOUND);
+            pool.add_user("other").await;
+            pool.remove("other").await;
+        };
+        tokio::time::timeout(Duration::from_secs(2), unrelated)
+            .await
+            .expect("operations on unrelated sessions stalled behind a slow SSH connect");
+
+        slow.abort();
+        accept.abort();
     }
 }
 
