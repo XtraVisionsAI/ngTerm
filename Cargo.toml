@@ -47,3 +47,4 @@ russh-sftp = "2.3.0"
 tokio-util = { version = "0.7", features = ["io"] }
 pin-project-lite = "0.2"
 regex = "1"
+flate2 = "1"

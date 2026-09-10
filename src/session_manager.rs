@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::audit_events::Integrity;
+use crate::recording::RecordingStore;
 use crate::scrollback::ScrollbackBuffer;
 use crate::ssh_bridge::SshCommand;
 
@@ -27,6 +29,9 @@ pub struct SessionEnded {
     /// `ssh_closed`, `user_closed`, `idle_timeout`, `input_closed` or
     /// `server_shutdown`.
     pub reason: String,
+    /// What the terminal recording achieved; `None` when the session was
+    /// not recorded at all.
+    pub recording: Option<Integrity>,
 }
 
 pub const REASON_SSH_CLOSED: &str = "ssh_closed";
@@ -67,14 +72,24 @@ pub struct SessionInfo {
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     ended_tx: mpsc::UnboundedSender<SessionEnded>,
+    recordings: Option<Arc<RecordingStore>>,
 }
 
 impl SessionManager {
-    pub fn new() -> (Self, mpsc::UnboundedReceiver<SessionEnded>) {
+    pub fn new(
+        recordings: Option<Arc<RecordingStore>>,
+    ) -> (Self, mpsc::UnboundedReceiver<SessionEnded>) {
         let (ended_tx, ended_rx) = mpsc::unbounded_channel();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         Self::start_timeout_checker(sessions.clone());
-        (Self { sessions, ended_tx }, ended_rx)
+        (
+            Self {
+                sessions,
+                ended_tx,
+                recordings,
+            },
+            ended_rx,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -89,8 +104,15 @@ impl SessionManager {
         mut output_rx: mpsc::Receiver<Vec<u8>>,
         ssh_cmd_tx: mpsc::Sender<SshCommand>,
         idle_timeout_secs: u32,
+        initial_size: (u16, u16),
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
+        // Recording starts before the first byte can arrive and runs in the
+        // fan-out task, so it does not depend on a browser being attached.
+        let recorder = self
+            .recordings
+            .as_ref()
+            .and_then(|r| r.start(&id, initial_size.0, initial_size.1));
         let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (input_tx, mut input_rx) = mpsc::channel::<SessionInput>(64);
         let (close_tx, mut close_rx) = oneshot::channel::<String>();
@@ -114,6 +136,9 @@ impl SessionManager {
                                         s.scrollback.push(bytes.clone());
                                     }
                                 }
+                                if let Some(r) = &recorder {
+                                    r.output(&bytes);
+                                }
                                 let _ = event_tx_clone.send(SessionEvent::Data(bytes));
                             }
                             None => {
@@ -125,9 +150,15 @@ impl SessionManager {
                     input = input_rx.recv() => {
                         match input {
                             Some(SessionInput::Data(bytes)) => {
+                                if let Some(r) = &recorder {
+                                    r.input(&bytes);
+                                }
                                 let _ = ssh_cmd_tx.send(SshCommand::Data(bytes)).await;
                             }
                             Some(SessionInput::Resize(cols, rows)) => {
+                                if let Some(r) = &recorder {
+                                    r.resize(cols, rows);
+                                }
                                 let _ = ssh_cmd_tx.send(SshCommand::Resize(cols as u32, rows as u32)).await;
                             }
                             None => {
@@ -151,9 +182,14 @@ impl SessionManager {
             }
             let _ = event_tx_clone.send(SessionEvent::Disconnected);
             sessions_ref.lock().unwrap().remove(&session_id);
+            let recording = match recorder {
+                Some(r) => Some(r.finish().await),
+                None => None,
+            };
             let _ = ended_tx.send(SessionEnded {
                 session_id: session_id.clone(),
                 reason: reason.clone(),
+                recording,
             });
             tracing::info!("Session fanout ended: {} ({})", session_id, reason);
         });
@@ -367,7 +403,7 @@ mod tests {
     }
 
     fn fixture(idle_timeout_secs: u32) -> Fixture {
-        let (mgr, ended_rx) = SessionManager::new();
+        let (mgr, ended_rx) = SessionManager::new(None);
         let (output_tx, output_rx) = mpsc::channel(8);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let id = mgr.create_session(
@@ -380,6 +416,7 @@ mod tests {
             output_rx,
             cmd_tx,
             idle_timeout_secs,
+            (80, 24),
         );
         Fixture {
             mgr,
@@ -438,6 +475,77 @@ mod tests {
         let ended = recv_ended(&mut f.ended_rx).await;
         assert_eq!(ended.reason, REASON_SSH_CLOSED);
         assert!(!f.mgr.session_exists(&f.id));
+    }
+
+    #[tokio::test]
+    async fn sessions_are_recorded_without_any_client_attached() {
+        let dir = std::env::temp_dir().join(format!("ngterm-sm-rec-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Database::open(dir.to_str().unwrap()).unwrap();
+        let store = RecordingStore::new(
+            db,
+            crate::recording::RecordingConfig::for_data_dir(dir.to_str().unwrap()),
+        )
+        .unwrap();
+        let (mgr, mut ended_rx) = SessionManager::new(Some(store.clone()));
+        let (output_tx, output_rx) = mpsc::channel(8);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        let id = mgr.create_session(
+            "srv".into(),
+            "alias".into(),
+            "host".into(),
+            None,
+            None,
+            "u1".into(),
+            output_rx,
+            cmd_tx,
+            0,
+            (120, 40),
+        );
+        // No subscriber, no WebSocket: output still has to be recorded.
+        output_tx.send(b"login: ".to_vec()).await.unwrap();
+        let input = mgr.input_tx(&id).unwrap();
+        input
+            .send(SessionInput::Data(b"root\r".to_vec()))
+            .await
+            .unwrap();
+        input.send(SessionInput::Resize(100, 30)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(output_tx);
+
+        let ended = recv_ended(&mut ended_rx).await;
+        assert_eq!(ended.reason, REASON_SSH_CLOSED);
+        assert_eq!(ended.recording, Some(Integrity::Complete));
+
+        let recs = store.list_for_session(&id).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!((recs[0].cols, recs[0].rows), (120, 40));
+        let events = store.read_events(&recs[0].recording_id).unwrap();
+        use crate::recording::EventKind;
+        assert!(matches!(
+            events[0].kind,
+            EventKind::Resize {
+                cols: 120,
+                rows: 40
+            }
+        ));
+        assert!(events
+            .iter()
+            .any(|e| e.kind == EventKind::Output(b"login: ".to_vec())));
+        assert!(events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::Input {
+                bytes: 5,
+                data: None
+            }
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e.kind,
+            EventKind::Resize {
+                cols: 100,
+                rows: 30
+            }
+        )));
     }
 
     #[tokio::test]

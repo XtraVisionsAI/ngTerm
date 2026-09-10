@@ -2,8 +2,9 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Mutex;
 
+#[derive(Clone)]
 pub struct Database {
-    conn: Mutex<Connection>,
+    conn: std::sync::Arc<Mutex<Connection>>,
 }
 
 type MigrationStep = fn(&Connection) -> Result<(), rusqlite::Error>;
@@ -17,6 +18,11 @@ const MIGRATIONS: &[(u32, &str, MigrationStep)] = &[
         "versioned audit sessions/operations/events",
         crate::audit_events::migration_v2_audit_events,
     ),
+    (
+        3,
+        "terminal recordings and chunk index",
+        crate::recording::migration_v3_recordings,
+    ),
 ];
 
 impl Database {
@@ -24,7 +30,7 @@ impl Database {
         let db_path = Path::new(data_dir).join("onemux.db");
         let conn = Connection::open(db_path)?;
         let db = Self {
-            conn: Mutex::new(conn),
+            conn: std::sync::Arc::new(Mutex::new(conn)),
         };
         db.migrate()?;
         Ok(db)

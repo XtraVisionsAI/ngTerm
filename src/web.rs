@@ -563,6 +563,7 @@ async fn handle_create_admin_terminal(
         pty_session.output_rx,
         pty_session.cmd_tx,
         3600,
+        (cols, rows),
     );
 
     state.helpers.register_local(&session_id).await;
@@ -987,6 +988,7 @@ async fn handle_create_session(
         ssh_session.output_rx,
         ssh_session.cmd_tx,
         server.idle_timeout_secs,
+        (cols as u16, rows as u16),
     );
 
     state

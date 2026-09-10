@@ -11,6 +11,7 @@ pub mod helper_pool;
 pub mod key_manager;
 pub mod local_pty;
 pub mod rate_limit;
+pub mod recording;
 pub mod scrollback;
 pub mod server_registry;
 pub mod server_tool_config;
@@ -33,6 +34,8 @@ pub struct AppState {
     pub auth_sessions: RwLock<auth::AuthSessionStore>,
     pub rate_limiter: rate_limit::RateLimiter,
     pub config: config::AppConfig,
+    /// `None` when recording is disabled or its storage could not be opened.
+    pub recordings: Option<Arc<recording::RecordingStore>>,
     pub admin_terminal_lock: tokio::sync::Mutex<()>,
 }
 
@@ -43,7 +46,28 @@ pub async fn build_app_state(
     Arc<AppState>,
     tokio::sync::mpsc::UnboundedReceiver<session_manager::SessionEnded>,
 ) {
-    let (session_manager, session_ended_rx) = session_manager::SessionManager::new();
+    let recordings = if config.recording.enabled {
+        match recording::RecordingStore::new(db.clone(), config.recording.clone()) {
+            Ok(store) => {
+                if let Err(e) = store.recover() {
+                    tracing::error!("Recording recovery failed: {}", e);
+                }
+                store
+                    .clone()
+                    .spawn_retention_task(std::time::Duration::from_secs(3600));
+                Some(store)
+            }
+            Err(e) => {
+                tracing::error!("Terminal recording disabled: {}", e);
+                None
+            }
+        }
+    } else {
+        tracing::warn!("Terminal recording is disabled by configuration");
+        None
+    };
+    let (session_manager, session_ended_rx) =
+        session_manager::SessionManager::new(recordings.clone());
 
     let mut auth_store = auth::AuthSessionStore::new();
     // Pre-insert admin secret derived from pepper so admin tool configs
@@ -62,6 +86,7 @@ pub async fn build_app_state(
         auth_sessions: RwLock::new(auth_store),
         rate_limiter: rate_limit::RateLimiter::new(),
         config,
+        recordings,
         admin_terminal_lock: tokio::sync::Mutex::new(()),
     });
 
@@ -87,12 +112,15 @@ pub fn spawn_session_reaper(
             if let Err(e) = audit::log_disconnect(&state.db, &ended.session_id, &ended.reason) {
                 tracing::error!("Failed to write disconnect audit log: {}", e);
             }
-            if let Err(e) = audit_events::session_ended(
-                &state.db,
-                &ended.session_id,
-                &ended.reason,
-                audit_events::Integrity::Complete,
-            ) {
+            let integrity = ended
+                .recording
+                .clone()
+                .unwrap_or(audit_events::Integrity::Truncated {
+                    reason: "session was not recorded".into(),
+                });
+            if let Err(e) =
+                audit_events::session_ended(&state.db, &ended.session_id, &ended.reason, integrity)
+            {
                 tracing::error!("Failed to close audit session record: {}", e);
             }
         }

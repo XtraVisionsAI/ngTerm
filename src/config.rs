@@ -4,6 +4,7 @@ pub struct AppConfig {
     pub data_dir: String,
     pub pepper: String,
     pub jwt_secret: Vec<u8>,
+    pub recording: crate::recording::RecordingConfig,
 }
 
 /// Hard resource limits. They bound what a single request or client can

@@ -61,6 +61,7 @@ async fn main() {
         data_dir: data_dir.clone(),
         pepper,
         jwt_secret,
+        recording: ngterm::recording::RecordingConfig::from_env(&data_dir),
     };
 
     let (state, session_ended_rx) = ngterm::build_app_state(app_config, database).await;
