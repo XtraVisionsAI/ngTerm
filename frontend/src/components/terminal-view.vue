@@ -203,6 +203,10 @@
       write(data)
     })
 
+    ws.onReset(() => {
+      terminal.value?.reset()
+    })
+
     ws.onSessionDisconnect(() => {
       const id = realSessionId.value || props.sessionId
       sessionStore.setStatus(id, 'disconnected')

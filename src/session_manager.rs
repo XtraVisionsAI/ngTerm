@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::scrollback::ScrollbackBuffer;
 use crate::ssh_bridge::SshCommand;
@@ -19,9 +19,19 @@ pub enum SessionInput {
     Resize(u16, u16),
 }
 
+/// Emitted exactly once per session when its fan-out task ends, whatever
+/// the cause. Consumers release per-session resources (helper SSH
+/// connection, audit row) here rather than at each individual exit path.
 pub struct SessionEnded {
     pub session_id: String,
+    /// `ssh_closed`, `user_closed`, `idle_timeout` or `input_closed`.
+    pub reason: String,
 }
+
+pub const REASON_SSH_CLOSED: &str = "ssh_closed";
+pub const REASON_USER_CLOSED: &str = "user_closed";
+pub const REASON_IDLE_TIMEOUT: &str = "idle_timeout";
+pub const REASON_INPUT_CLOSED: &str = "input_closed";
 
 struct Session {
     pub id: String,
@@ -37,6 +47,8 @@ struct Session {
     ws_count: u32,
     last_activity: Instant,
     idle_timeout_secs: u32,
+    /// Tells the fan-out task to shut the transport down; carries the reason.
+    close_tx: Option<oneshot::Sender<String>>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -79,6 +91,7 @@ impl SessionManager {
         let id = uuid::Uuid::new_v4().to_string();
         let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (input_tx, mut input_rx) = mpsc::channel::<SessionInput>(64);
+        let (close_tx, mut close_rx) = oneshot::channel::<String>();
 
         let event_tx_clone = event_tx.clone();
         let session_id = id.clone();
@@ -86,7 +99,7 @@ impl SessionManager {
         let ended_tx = self.ended_tx.clone();
 
         tokio::spawn(async move {
-            let mut ssh_disconnected = false;
+            let reason: String;
             loop {
                 tokio::select! {
                     data = output_rx.recv() => {
@@ -102,8 +115,7 @@ impl SessionManager {
                                 let _ = event_tx_clone.send(SessionEvent::Data(bytes));
                             }
                             None => {
-                                let _ = event_tx_clone.send(SessionEvent::Disconnected);
-                                ssh_disconnected = true;
+                                reason = REASON_SSH_CLOSED.to_string();
                                 break;
                             }
                         }
@@ -117,22 +129,31 @@ impl SessionManager {
                                 let _ = ssh_cmd_tx.send(SshCommand::Resize(cols as u32, rows as u32)).await;
                             }
                             None => {
-                                let _ = ssh_cmd_tx.send(SshCommand::Close).await;
+                                reason = REASON_INPUT_CLOSED.to_string();
                                 break;
                             }
                         }
                     }
+                    requested = &mut close_rx => {
+                        reason = requested.unwrap_or_else(|_| REASON_INPUT_CLOSED.to_string());
+                        break;
+                    }
                 }
             }
 
-            // Clean up and notify
-            sessions_ref.lock().unwrap().remove(&session_id);
-            if ssh_disconnected {
-                let _ = ended_tx.send(SessionEnded {
-                    session_id: session_id.clone(),
-                });
+            // Tear down in a fixed order regardless of the trigger: close the
+            // transport, tell subscribers, drop the registry entry, then let
+            // the owner of per-session resources know exactly once.
+            if reason != REASON_SSH_CLOSED {
+                let _ = ssh_cmd_tx.send(SshCommand::Close).await;
             }
-            tracing::info!("Session fanout ended: {}", session_id);
+            let _ = event_tx_clone.send(SessionEvent::Disconnected);
+            sessions_ref.lock().unwrap().remove(&session_id);
+            let _ = ended_tx.send(SessionEnded {
+                session_id: session_id.clone(),
+                reason: reason.clone(),
+            });
+            tracing::info!("Session fanout ended: {} ({})", session_id, reason);
         });
 
         let session = Session {
@@ -149,6 +170,7 @@ impl SessionManager {
             ws_count: 0,
             last_activity: Instant::now(),
             idle_timeout_secs,
+            close_tx: Some(close_tx),
         };
 
         self.sessions.lock().unwrap().insert(id.clone(), session);
@@ -209,18 +231,37 @@ impl SessionManager {
         self.sessions.lock().unwrap().len()
     }
 
+    /// Ask the session to close. Returns false if it does not exist or is
+    /// owned by someone else. Resource release happens when the fan-out task
+    /// reports `SessionEnded`, so callers must not clean up themselves.
     pub fn remove_session(&self, id: &str, user_id: &str) -> bool {
         let mut sessions = self.sessions.lock().unwrap();
-        if let Some(session) = sessions.get(id) {
-            if session.user_id != user_id {
-                return false;
+        match sessions.get_mut(id) {
+            Some(session) if session.user_id == user_id => {
+                Self::request_close(session, REASON_USER_CLOSED);
+                true
             }
-            let _ = session.event_tx.send(SessionEvent::Disconnected);
-            sessions.remove(id);
-            true
-        } else {
-            false
+            _ => false,
         }
+    }
+
+    fn request_close(session: &mut Session, reason: &str) {
+        if let Some(tx) = session.close_tx.take() {
+            let _ = tx.send(reason.to_string());
+        }
+    }
+
+    pub fn session_exists(&self, id: &str) -> bool {
+        self.sessions.lock().unwrap().contains_key(id)
+    }
+
+    pub fn session_count_for_user(&self, user_id: &str) -> usize {
+        self.sessions
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.user_id == user_id)
+            .count()
     }
 
     pub fn is_owner(&self, session_id: &str, user_id: &str) -> bool {
@@ -268,35 +309,136 @@ impl SessionManager {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                let timed_out: Vec<String> = {
-                    let sessions = sessions.lock().unwrap();
-                    sessions
-                        .values()
-                        .filter(|s| {
-                            s.idle_timeout_secs > 0
-                                && s.ws_count == 0
-                                && s.last_activity.elapsed().as_secs() > s.idle_timeout_secs as u64
-                        })
-                        .map(|s| s.id.clone())
-                        .collect()
-                };
-                for id in timed_out {
-                    let event_tx = {
-                        let mut sessions = sessions.lock().unwrap();
-                        if let Some(session) = sessions.get(&id) {
-                            let tx = session.event_tx.clone();
-                            let _ = tx.send(SessionEvent::Disconnected);
-                            sessions.remove(&id);
-                            Some(())
-                        } else {
-                            None
-                        }
-                    };
-                    if event_tx.is_some() {
-                        tracing::info!("Session {} timed out, closing", id);
-                    }
-                }
+                Self::close_idle_sessions(&sessions);
             }
         });
+    }
+
+    /// Request closure of every session that has no WebSocket attached and
+    /// has been idle longer than its configured timeout. Closing goes through
+    /// the fan-out task so the transport, subscribers and per-session
+    /// resources are released the same way as for any other exit.
+    fn close_idle_sessions(sessions: &Mutex<HashMap<String, Session>>) {
+        let mut sessions = sessions.lock().unwrap();
+        for s in sessions.values_mut() {
+            let idle = s.idle_timeout_secs > 0
+                && s.ws_count == 0
+                && s.last_activity.elapsed()
+                    >= std::time::Duration::from_secs(s.idle_timeout_secs as u64);
+            if idle && s.close_tx.is_some() {
+                tracing::info!(
+                    "Session {} idle for {}s, closing",
+                    s.id,
+                    s.idle_timeout_secs
+                );
+                Self::request_close(s, REASON_IDLE_TIMEOUT);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct Fixture {
+        mgr: SessionManager,
+        ended_rx: mpsc::UnboundedReceiver<SessionEnded>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        cmd_rx: mpsc::Receiver<SshCommand>,
+        id: String,
+    }
+
+    fn fixture(idle_timeout_secs: u32) -> Fixture {
+        let (mgr, ended_rx) = SessionManager::new();
+        let (output_tx, output_rx) = mpsc::channel(8);
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let id = mgr.create_session(
+            "srv".into(),
+            "alias".into(),
+            "host".into(),
+            None,
+            None,
+            "u1".into(),
+            output_rx,
+            cmd_tx,
+            idle_timeout_secs,
+        );
+        Fixture {
+            mgr,
+            ended_rx,
+            output_tx,
+            cmd_rx,
+            id,
+        }
+    }
+
+    async fn recv_ended(rx: &mut mpsc::UnboundedReceiver<SessionEnded>) -> SessionEnded {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("SessionEnded not emitted")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn user_close_tears_down_transport_and_reports_once() {
+        let mut f = fixture(0);
+        let mut events = f.mgr.subscribe(&f.id).unwrap();
+        let held_input = f.mgr.input_tx(&f.id).unwrap(); // a lingering WS/agent clone
+
+        assert!(!f.mgr.remove_session(&f.id, "someone-else"));
+        assert!(f.mgr.remove_session(&f.id, "u1"));
+
+        let ended = recv_ended(&mut f.ended_rx).await;
+        assert_eq!(ended.session_id, f.id);
+        assert_eq!(ended.reason, REASON_USER_CLOSED);
+        assert!(matches!(f.cmd_rx.recv().await, Some(SshCommand::Close)));
+        assert!(matches!(
+            events.recv().await,
+            Ok(SessionEvent::Disconnected)
+        ));
+        assert!(!f.mgr.session_exists(&f.id));
+        assert_eq!(f.mgr.session_count_for_user("u1"), 0);
+
+        // Second removal is a no-op and does not emit again.
+        assert!(!f.mgr.remove_session(&f.id, "u1"));
+        drop(held_input);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), f.ended_rx.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_exit_reports_ssh_closed() {
+        let mut f = fixture(0);
+        f.output_tx.send(b"hello".to_vec()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(f.mgr.get_scrollback(&f.id), vec![b"hello".to_vec()]);
+
+        drop(f.output_tx);
+        let ended = recv_ended(&mut f.ended_rx).await;
+        assert_eq!(ended.reason, REASON_SSH_CLOSED);
+        assert!(!f.mgr.session_exists(&f.id));
+    }
+
+    #[tokio::test]
+    async fn idle_sessions_without_clients_are_closed() {
+        let mut f = fixture(1);
+        // Attached client: never idle-closed.
+        f.mgr.ws_connected(&f.id);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        SessionManager::close_idle_sessions(&f.mgr.sessions);
+        assert!(f.mgr.session_exists(&f.id));
+
+        // Detached and idle past the timeout: closed with a distinct reason.
+        f.mgr.ws_disconnected(&f.id);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        SessionManager::close_idle_sessions(&f.mgr.sessions);
+        let ended = recv_ended(&mut f.ended_rx).await;
+        assert_eq!(ended.reason, REASON_IDLE_TIMEOUT);
+        assert!(matches!(f.cmd_rx.recv().await, Some(SshCommand::Close)));
     }
 }

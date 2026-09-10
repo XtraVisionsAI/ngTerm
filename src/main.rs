@@ -63,18 +63,9 @@ async fn main() {
         jwt_secret,
     };
 
-    let (state, mut session_ended_rx) = ngterm::build_app_state(app_config, database).await;
+    let (state, session_ended_rx) = ngterm::build_app_state(app_config, database).await;
 
-    let audit_state = state.clone();
-    tokio::spawn(async move {
-        while let Some(ended) = session_ended_rx.recv().await {
-            audit_state.helpers.remove(&ended.session_id).await;
-            if let Err(e) = audit::log_disconnect(&audit_state.db, &ended.session_id, "ssh_closed")
-            {
-                tracing::error!("Failed to write disconnect audit log: {}", e);
-            }
-        }
-    });
+    ngterm::spawn_session_reaper(state.clone(), session_ended_rx);
 
     let app = web::build_router(state.clone());
 

@@ -13,6 +13,7 @@ export function useWebSocket(sessionId: string, token: string) {
   let ws: WebSocket | null = null
   let onData: ((data: Uint8Array) => void) | null = null
   let onDisconnect: (() => void) | null = null
+  let onResetCb: (() => void) | null = null
   let retryCount = 0
   let consecutiveFailures = 0
   let retryTimer: ReturnType<typeof setTimeout> | null = null
@@ -62,6 +63,11 @@ export function useWebSocket(sessionId: string, token: string) {
         if (msg.type === 'output' && msg.data && onData) {
           const bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0))
           onData(bytes)
+        } else if (msg.type === 'reset') {
+          // Server is about to replay its retained scrollback (initial
+          // connect, reconnect, or after we fell behind): drop what we have
+          // so the replay does not duplicate it.
+          onResetCb?.()
         } else if (msg.type === 'disconnected') {
           disconnected.value = true
           intentionalClose = true
@@ -127,5 +133,20 @@ export function useWebSocket(sessionId: string, token: string) {
     onDisconnect = fn
   }
 
-  return { connected, reconnecting, disconnected, connect, send, resize, close, onOutput, onSessionDisconnect }
+  function onReset(fn: () => void) {
+    onResetCb = fn
+  }
+
+  return {
+    connected,
+    reconnecting,
+    disconnected,
+    connect,
+    send,
+    resize,
+    close,
+    onOutput,
+    onReset,
+    onSessionDisconnect
+  }
 }

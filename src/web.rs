@@ -15,6 +15,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::audit;
 use crate::auth;
+use crate::config::limits;
 use crate::crypto;
 use crate::extractors::{AdminUser, AuthUser};
 use crate::key_manager::{self, CreateKeyRequest};
@@ -89,14 +90,20 @@ pub fn build_router_with_hooks(state: Arc<AppState>, hooks: RouterHooks) -> Rout
         // Files (SFTP)
         .route("/sessions/{id}/files", get(handle_list_files))
         .route("/sessions/{id}/files/content", get(handle_read_file))
-        .route("/sessions/{id}/files/content", put(handle_write_file))
+        .route(
+            "/sessions/{id}/files/content",
+            put(handle_write_file).layer(DefaultBodyLimit::max(limits::MAX_FILE_WRITE_BYTES)),
+        )
         .route("/sessions/{id}/files", delete(handle_delete_file))
         .route("/sessions/{id}/files/mkdir", post(handle_mkdir))
         .route("/sessions/{id}/files/rename", post(handle_rename_file))
         .route("/sessions/{id}/files/home", get(handle_home_dir))
         .route("/sessions/{id}/files/stat", get(handle_stat_file))
         .route("/sessions/{id}/files/download", get(handle_download_file))
-        .route("/sessions/{id}/files/upload", post(handle_upload_file))
+        .route(
+            "/sessions/{id}/files/upload",
+            post(handle_upload_file).layer(DefaultBodyLimit::max(limits::MAX_UPLOAD_BYTES)),
+        )
         // Git
         .route("/sessions/{id}/git/status", get(handle_git_status))
         .route("/sessions/{id}/git/log", get(handle_git_log))
@@ -146,7 +153,7 @@ pub fn build_router_with_hooks(state: Arc<AppState>, hooks: RouterHooks) -> Rout
         .route("/ws/terminal/{session_id}", get(ws_handler::ws_terminal))
         .route("/ws/agent/{agent_id}", get(ws_handler::ws_agent))
         .fallback(static_handler)
-        .layer(DefaultBodyLimit::disable())
+        .layer(DefaultBodyLimit::max(limits::MAX_JSON_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -530,6 +537,9 @@ async fn handle_create_admin_terminal(
     );
 
     state.helpers.register_local(&session_id).await;
+    if !state.sessions.session_exists(&session_id) {
+        state.helpers.remove(&session_id).await;
+    }
 
     let _ = audit::log_connect(
         &state.db,
@@ -799,6 +809,19 @@ async fn handle_create_session(
         None => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
+    if state.sessions.session_count_for_user(&user_id) >= limits::MAX_SESSIONS_PER_USER {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ApiError {
+                error: format!(
+                    "Too many open sessions (limit {})",
+                    limits::MAX_SESSIONS_PER_USER
+                ),
+            }),
+        )
+            .into_response();
+    }
+
     let server = match server_registry::get_server(&state.db, &req.server_id) {
         Ok(Some(s)) => s,
         Ok(None) => {
@@ -913,6 +936,11 @@ async fn handle_create_session(
         .helpers
         .register_handle(&session_id, ssh_session.handle)
         .await;
+    // The transport may already have died and been reaped before the helper
+    // was registered; do not leave an orphaned connection behind.
+    if !state.sessions.session_exists(&session_id) {
+        state.helpers.remove(&session_id).await;
+    }
 
     let username = state
         .db
@@ -952,12 +980,10 @@ async fn handle_delete_session(
     Path(id): Path<String>,
     AuthUser(user_id): AuthUser,
 ) -> impl IntoResponse {
+    // Closing goes through the session's fan-out task; the helper
+    // connection, bound agent and audit row are released by the reaper when
+    // it reports SessionEnded, exactly as for any other exit.
     if state.sessions.remove_session(&id, &user_id) {
-        // An agent bound to this terminal cannot outlive it: dropping the
-        // session closes its stdin, which stops the engine / CLI.
-        state.agents.stop(&format!("agent-{}", id)).await;
-        state.helpers.remove(&id).await;
-        let _ = audit::log_disconnect(&state.db, &id, "user_closed");
         StatusCode::NO_CONTENT.into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()
@@ -1216,8 +1242,35 @@ async fn handle_read_file(
         return (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response();
     }
 
+    // Preview loads the whole file into memory: refuse oversized files up
+    // front instead of buffering them.
+    if let Ok(meta) = state.helpers.sftp_stat(&session_id, &query.path).await {
+        if meta.size > limits::MAX_PREVIEW_BYTES {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(ApiError {
+                    error: format!(
+                        "File is {} bytes; preview is limited to {} bytes. Use download instead.",
+                        meta.size,
+                        limits::MAX_PREVIEW_BYTES
+                    ),
+                }),
+            )
+                .into_response();
+        }
+    }
+
     match state.helpers.sftp_read(&session_id, &query.path).await {
         Ok(data) => {
+            if data.len() as u64 > limits::MAX_PREVIEW_BYTES {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(ApiError {
+                        error: "File too large to preview".to_string(),
+                    }),
+                )
+                    .into_response();
+            }
             let content = String::from_utf8_lossy(&data).to_string();
             Json(serde_json::json!({ "content": content })).into_response()
         }

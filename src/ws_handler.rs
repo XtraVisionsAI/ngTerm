@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::agent_bridge::AgentEvent;
 use crate::auth;
+use crate::config::limits;
 use crate::session_manager::{SessionEvent, SessionInput};
 use crate::AppState;
 
@@ -54,7 +55,66 @@ pub async fn ws_terminal(
             .unwrap();
     }
 
-    ws.on_upgrade(move |socket| handle_ws(socket, session_id, state))
+    ws.max_message_size(limits::MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(limits::MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_ws(socket, session_id, state))
+}
+
+/// Keeps the session's attached-client count balanced on every exit path,
+/// including early returns while replaying scrollback.
+struct WsAttachment<'a> {
+    state: &'a AppState,
+    session_id: &'a str,
+}
+
+impl<'a> WsAttachment<'a> {
+    fn attach(state: &'a AppState, session_id: &'a str) -> Self {
+        state.sessions.ws_connected(session_id);
+        Self { state, session_id }
+    }
+}
+
+impl Drop for WsAttachment<'_> {
+    fn drop(&mut self) {
+        self.state.sessions.ws_disconnected(self.session_id);
+    }
+}
+
+fn output_message(bytes: &[u8]) -> Message {
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    Message::Text(
+        serde_json::json!({"type": "output", "data": b64})
+            .to_string()
+            .into(),
+    )
+}
+
+fn control_message(kind: &str) -> Message {
+    Message::Text(serde_json::json!({"type": kind}).to_string().into())
+}
+
+/// Build the full replay sequence for a (re)connecting client: one `reset`
+/// so the client discards whatever it already rendered, the retained
+/// scrollback, then `replay_done`. Used both on connect and after the client
+/// fell behind the live broadcast, so there is exactly one way to resync.
+fn replay_messages(scrollback: &[Vec<u8>]) -> Vec<Message> {
+    let mut out = Vec::with_capacity(scrollback.len() + 2);
+    out.push(control_message("reset"));
+    out.extend(scrollback.iter().map(|d| output_message(d)));
+    out.push(control_message("replay_done"));
+    out
+}
+
+async fn send_all<S>(sink: &mut S, messages: Vec<Message>) -> bool
+where
+    S: SinkExt<Message> + Unpin,
+{
+    for msg in messages {
+        if sink.send(msg).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) {
@@ -70,20 +130,12 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
 
     let (mut ws_sink, mut ws_stream) = socket.split();
 
-    state.sessions.ws_connected(&session_id);
+    // Counted as attached from here on; the guard undoes it on every exit.
+    let _attachment = WsAttachment::attach(&state, &session_id);
 
-    // Replay scrollback
     let scrollback = state.sessions.get_scrollback(&session_id);
-    for data in scrollback {
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
-        let msg = serde_json::json!({"type": "output", "data": b64});
-        if ws_sink
-            .send(Message::Text(msg.to_string().into()))
-            .await
-            .is_err()
-        {
-            return;
-        }
+    if !send_all(&mut ws_sink, replay_messages(&scrollback)).await {
+        return;
     }
 
     loop {
@@ -91,35 +143,23 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
             result = event_rx.recv() => {
                 match result {
                     Ok(SessionEvent::Data(bytes)) => {
-                        let b64 = base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD, &bytes);
-                        let msg = serde_json::json!({"type": "output", "data": b64});
-                        if ws_sink.send(Message::Text(msg.to_string().into())).await.is_err() {
+                        if ws_sink.send(output_message(&bytes)).await.is_err() {
                             break;
                         }
                     }
                     Ok(SessionEvent::Disconnected) => {
-                        let msg = serde_json::json!({"type": "disconnected"});
-                        let _ = ws_sink.send(Message::Text(msg.to_string().into())).await;
+                        let _ = ws_sink.send(control_message("disconnected")).await;
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("WS client lagged {} messages for session {}, resending scrollback", n, session_id);
+                        tracing::warn!("WS client lagged {} messages for session {}, resyncing from scrollback", n, session_id);
                         let scrollback = state.sessions.get_scrollback(&session_id);
-                        for data in scrollback {
-                            let b64 = base64::Engine::encode(
-                                &base64::engine::general_purpose::STANDARD, &data);
-                            let msg = serde_json::json!({"type": "reset"});
-                            let _ = ws_sink.send(Message::Text(msg.to_string().into())).await;
-                            let msg = serde_json::json!({"type": "output", "data": b64});
-                            if ws_sink.send(Message::Text(msg.to_string().into())).await.is_err() {
-                                break;
-                            }
+                        if !send_all(&mut ws_sink, replay_messages(&scrollback)).await {
+                            break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        let msg = serde_json::json!({"type": "disconnected"});
-                        let _ = ws_sink.send(Message::Text(msg.to_string().into())).await;
+                        let _ = ws_sink.send(control_message("disconnected")).await;
                         break;
                     }
                 }
@@ -145,12 +185,12 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
                     _ => {}
                 }
             }
         }
     }
-    state.sessions.ws_disconnected(&session_id);
 }
 
 // --- Agent WebSocket ---
@@ -236,7 +276,9 @@ pub async fn ws_agent(
         Some(true) => {}
     }
 
-    ws.on_upgrade(move |socket| handle_agent_ws(socket, agent_id, user_id, state))
+    ws.max_message_size(limits::MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(limits::MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_agent_ws(socket, agent_id, user_id, state))
 }
 
 async fn handle_agent_ws(
@@ -358,6 +400,31 @@ async fn handle_agent_ws(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text_of(msg: &Message) -> serde_json::Value {
+        match msg {
+            Message::Text(t) => serde_json::from_str(t).unwrap(),
+            _ => panic!("expected text frame"),
+        }
+    }
+
+    #[test]
+    fn replay_is_reset_then_chunks_then_done() {
+        let msgs = replay_messages(&[b"ab".to_vec(), b"cd".to_vec()]);
+        let kinds: Vec<String> = msgs
+            .iter()
+            .map(|m| text_of(m)["type"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kinds, ["reset", "output", "output", "replay_done"]);
+        assert_eq!(text_of(&msgs[1])["data"], "YWI=");
+
+        // Empty scrollback still tells the client to clear stale content.
+        let kinds: Vec<String> = replay_messages(&[])
+            .iter()
+            .map(|m| text_of(m)["type"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kinds, ["reset", "replay_done"]);
+    }
 
     #[test]
     fn permission_response_accepts_flat_and_nested_forms() {

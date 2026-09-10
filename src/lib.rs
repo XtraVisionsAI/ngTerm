@@ -66,3 +66,26 @@ pub async fn build_app_state(
 
     (state, session_ended_rx)
 }
+
+/// Release per-session resources when a session's fan-out task ends. This is
+/// the single place helper connections are dropped and the audit row is
+/// closed, so every exit path (SSH closed, user closed, idle, input closed)
+/// is accounted for exactly once.
+pub fn spawn_session_reaper(
+    state: Arc<AppState>,
+    mut session_ended_rx: tokio::sync::mpsc::UnboundedReceiver<session_manager::SessionEnded>,
+) {
+    tokio::spawn(async move {
+        while let Some(ended) = session_ended_rx.recv().await {
+            // An agent bound to this terminal cannot outlive it.
+            state
+                .agents
+                .stop(&format!("agent-{}", ended.session_id))
+                .await;
+            state.helpers.remove(&ended.session_id).await;
+            if let Err(e) = audit::log_disconnect(&state.db, &ended.session_id, &ended.reason) {
+                tracing::error!("Failed to write disconnect audit log: {}", e);
+            }
+        }
+    });
+}
