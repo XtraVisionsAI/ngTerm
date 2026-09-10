@@ -40,7 +40,7 @@ pub fn spawn(cols: u16, rows: u16) -> Result<LocalPtySession, String> {
                 if slave_fd > 2 {
                     libc::close(slave_fd);
                 }
-                libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0);
+                libc::ioctl(0, libc::TIOCSCTTY as _, 0);
                 Ok(())
             })
             .spawn()
