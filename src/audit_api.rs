@@ -292,6 +292,35 @@ pub async fn get_operation(
     .into_response()
 }
 
+// --- System -------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemQuery {
+    pub limit: Option<u32>,
+}
+
+/// Start/shutdown events with what each start had to recover. Admin only:
+/// they describe the process, not any user's activity.
+pub async fn list_system_events(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Query(q): Query<SystemQuery>,
+) -> Response {
+    if !caller.is_admin {
+        return err(StatusCode::FORBIDDEN, "Admin required");
+    }
+    let limit = q.limit.unwrap_or(50).clamp(1, MAX_PAGE);
+    match audit_events::recent_events(&state.db, crate::audit_system::SYSTEM_STREAM, limit) {
+        Ok(items) => Json(serde_json::json!({
+            "items": items,
+            "current": state.startup,
+        }))
+        .into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
 // --- Recordings ---------------------------------------------------------------
 
 /// A recording the caller may read, resolved through its session's owner.
@@ -819,6 +848,30 @@ mod tests {
         assert_eq!(access[0].event_type, "audit.export");
         assert_eq!(access[0].payload["userId"], "u1");
         assert_eq!(access[1].payload["admin"], true);
+    }
+
+    #[tokio::test]
+    async fn system_events_are_admin_only_and_include_the_current_start() {
+        let state = test_state().await;
+        let resp = list_system_events(
+            State(state.clone()),
+            user("u1"),
+            Query(SystemQuery::default()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let (st, v) = body_json(
+            list_system_events(State(state.clone()), admin(), Query(SystemQuery::default())).await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["items"][0]["eventType"], "system.startup");
+        assert_eq!(
+            v["current"]["previousShutdownClean"],
+            serde_json::Value::Null
+        );
+        assert_eq!(v["current"]["sessionsClosed"], 0);
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ pub mod audit_api;
 pub mod audit_config;
 pub mod audit_events;
 pub mod audit_ops;
+pub mod audit_system;
 pub mod auth;
 pub mod config;
 pub mod crypto;
@@ -40,6 +41,8 @@ pub struct AppState {
     /// `None` when recording is disabled or its storage could not be opened.
     pub recordings: Option<Arc<recording::RecordingStore>>,
     pub admin_terminal_lock: tokio::sync::Mutex<()>,
+    /// What this process had to recover at start (exposed via /api/health).
+    pub startup: audit_system::StartupReport,
 }
 
 pub async fn build_app_state(
@@ -49,11 +52,13 @@ pub async fn build_app_state(
     Arc<AppState>,
     tokio::sync::mpsc::UnboundedReceiver<session_manager::SessionEnded>,
 ) {
+    let mut recordings_interrupted = 0;
     let recordings = if config.recording.enabled {
         match recording::RecordingStore::new(db.clone(), config.recording.clone()) {
             Ok(store) => {
-                if let Err(e) = store.recover() {
-                    tracing::error!("Recording recovery failed: {}", e);
+                match store.recover() {
+                    Ok(n) => recordings_interrupted = n,
+                    Err(e) => tracing::error!("Recording recovery failed: {}", e),
                 }
                 store
                     .clone()
@@ -68,6 +73,15 @@ pub async fn build_app_state(
     } else {
         tracing::warn!("Terminal recording is disabled by configuration");
         None
+    };
+    // Sessions and operations the previous process left open are closed as
+    // interrupted before anything new is accepted, and the start is recorded.
+    let startup = match audit_system::startup(&db, recordings_interrupted, recordings.is_some()) {
+        Ok(report) => report,
+        Err((report, e)) => {
+            tracing::error!("Startup could not be recorded in the audit store: {}", e);
+            report
+        }
     };
     let (session_manager, session_ended_rx) =
         session_manager::SessionManager::new(recordings.clone());
@@ -91,6 +105,7 @@ pub async fn build_app_state(
         config,
         recordings,
         admin_terminal_lock: tokio::sync::Mutex::new(()),
+        startup,
     });
 
     (state, session_ended_rx)
@@ -199,6 +214,9 @@ pub async fn shutdown_state(state: &Arc<AppState>) {
         ),
         Err(e) => tracing::error!("Failed to close audit rows at shutdown: {}", e),
         _ => {}
+    }
+    if let Err(e) = audit_system::shutdown(&state.db, requested, leftover) {
+        tracing::error!("Shutdown could not be recorded in the audit store: {}", e);
     }
     tracing::info!(
         "Shutdown complete: {} session(s) asked to close, {} did not confirm in time",

@@ -872,6 +872,56 @@ pub(crate) fn redact_json(v: serde_json::Value) -> serde_json::Value {
     }
 }
 
+const EVENT_COLUMNS: &str = "event_id, schema_version, stream_id, seq, occurred_at, recorded_at, session_id, operation_id, event_type, payload, integrity, integrity_detail";
+
+/// Close every audit session still open (server restart or shutdown). The
+/// sessions' streams stopped without a confirmed end, so they are marked
+/// truncated with `detail`, and their unfinished operations interrupted.
+pub fn close_open_sessions(db: &Database, reason: &str, detail: &str) -> Result<usize, String> {
+    let ts = now();
+    db.conn()
+        .execute(
+            "UPDATE audit_sessions SET disconnected_at = ?1, disconnect_reason = ?2, integrity = 'truncated', integrity_detail = ?3 WHERE disconnected_at IS NULL",
+            params![ts, reason, detail],
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// Mark every operation still `intended` or `running` as interrupted: the
+/// process that was executing it is gone, so its outcome is unknown.
+pub fn interrupt_open_operations(db: &Database, reason: &str) -> Result<usize, String> {
+    let exit = to_json(&ExitStatus::Unknown {
+        reason: reason.to_string(),
+    });
+    db.conn()
+        .execute(
+            "UPDATE audit_operations SET status = 'interrupted', exit_json = ?1, finished_at = ?2 WHERE status IN ('intended','running')",
+            params![exit, now()],
+        )
+        .map_err(|e| e.to_string())
+}
+
+/// The most recent events of a stream, newest first.
+pub fn recent_events(
+    db: &Database,
+    stream_id: &str,
+    limit: u32,
+) -> Result<Vec<AuditEvent>, String> {
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {} FROM audit_events WHERE stream_id = ?1 ORDER BY seq DESC LIMIT ?2",
+            EVENT_COLUMNS
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![stream_id, limit], row_to_event)
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
 /// Events of a stream after `after_seq`, in order. Gaps in `seq` are not
 /// expected (assignment is transactional) but the caller can detect them.
 pub fn events_after(
@@ -882,9 +932,10 @@ pub fn events_after(
 ) -> Result<Vec<AuditEvent>, String> {
     let conn = db.conn();
     let mut stmt = conn
-        .prepare(
-            "SELECT event_id, schema_version, stream_id, seq, occurred_at, recorded_at, session_id, operation_id, event_type, payload, integrity, integrity_detail FROM audit_events WHERE stream_id = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
-        )
+        .prepare(&format!(
+            "SELECT {} FROM audit_events WHERE stream_id = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
+            EVENT_COLUMNS
+        ))
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![stream_id, after_seq, limit], row_to_event)

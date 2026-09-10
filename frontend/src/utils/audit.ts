@@ -42,7 +42,7 @@ export interface OperationRecord {
   target: Target
   cwd: string | null
   status: string
-  exit: { Known: { code: number } } | { Unknown: { reason: string } } | null
+  exit: { kind: 'known'; code: number } | { kind: 'unknown'; reason: string } | null
   evidence: string
   startedAt: string
   finishedAt: string | null
@@ -104,6 +104,16 @@ export interface ConfigChangePayload {
   before: Record<string, unknown> | null
   after: Record<string, unknown> | null
   changedFields: string[]
+}
+
+/** Startup report of the running process, as returned in /audit/system. */
+export interface StartupReport {
+  startedAt: string
+  previousShutdownClean: boolean | null
+  sessionsClosed: number
+  operationsInterrupted: number
+  recordingsInterrupted: number
+  recordingEnabled: boolean
 }
 
 export type TagType = 'default' | 'success' | 'warning' | 'error' | 'info'
@@ -197,8 +207,8 @@ export function integrityInfo(i: Integrity | undefined): { label: string; type: 
 
 export function exitLabel(exit: OperationRecord['exit']): string {
   if (!exit) return '-'
-  if ('Known' in exit) return String(exit.Known.code)
-  return `未知（${exit.Unknown.reason}）`
+  if (exit.kind === 'known') return String(exit.code)
+  return `未知（${exit.reason}）`
 }
 
 export function formatMs(ms: number): string {

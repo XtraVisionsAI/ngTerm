@@ -1,11 +1,14 @@
 <script setup lang="ts">
   import { NTabPane, NTabs } from 'naive-ui'
   import { ref } from 'vue'
+  import { useAuthStore } from '@/stores/auth'
   import AuditConnections from './components/audit-connections.vue'
   import AuditOperations from './components/audit-operations.vue'
   import AuditSessions from './components/audit-sessions.vue'
+  import AuditSystem from './components/audit-system.vue'
 
-  const tab = ref<'sessions' | 'operations' | 'connections'>('sessions')
+  const auth = useAuthStore()
+  const tab = ref<'sessions' | 'operations' | 'connections' | 'system'>('sessions')
 </script>
 
 <template>
@@ -22,6 +25,9 @@
       </n-tab-pane>
       <n-tab-pane name="connections" tab="连接日志" display-directive="show:lazy">
         <audit-connections />
+      </n-tab-pane>
+      <n-tab-pane v-if="auth.isAdmin" name="system" tab="系统事件" display-directive="show:lazy">
+        <audit-system />
       </n-tab-pane>
     </n-tabs>
   </div>

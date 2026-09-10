@@ -164,6 +164,7 @@ pub fn build_router_with_hooks(state: Arc<AppState>, hooks: RouterHooks) -> Rout
             get(audit_api::recording_events),
         )
         .route("/audit/export", get(audit_api::export))
+        .route("/audit/system", get(audit_api::list_system_events))
         // UI State
         .route("/ui-state", get(handle_get_ui_state))
         .route("/ui-state", put(handle_save_ui_state));
@@ -199,6 +200,15 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         "activeSessions": state.sessions.list_all_session_count(),
         "activeAgents": state.agents.active_count().await,
         "schemaVersion": state.db.schema_version(),
+        "audit": {
+            "previousShutdownClean": state.startup.previous_shutdown_clean,
+            "recoveredAtStartup": {
+                "sessions": state.startup.sessions_closed,
+                "operations": state.startup.operations_interrupted,
+                "recordings": state.startup.recordings_interrupted,
+            },
+            "recordingEnabled": state.startup.recording_enabled,
+        },
     });
     let code = if db_ok {
         StatusCode::OK
