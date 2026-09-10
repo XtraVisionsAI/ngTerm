@@ -1679,6 +1679,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "flate2",
  "futures",
  "hex",
  "hkdf 0.12.4",
