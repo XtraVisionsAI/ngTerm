@@ -1,6 +1,7 @@
 pub mod agent_bridge;
 pub mod ai_tool_registry;
 pub mod audit;
+pub mod audit_events;
 pub mod auth;
 pub mod config;
 pub mod crypto;
@@ -85,6 +86,14 @@ pub fn spawn_session_reaper(
             state.helpers.remove(&ended.session_id).await;
             if let Err(e) = audit::log_disconnect(&state.db, &ended.session_id, &ended.reason) {
                 tracing::error!("Failed to write disconnect audit log: {}", e);
+            }
+            if let Err(e) = audit_events::session_ended(
+                &state.db,
+                &ended.session_id,
+                &ended.reason,
+                audit_events::Integrity::Complete,
+            ) {
+                tracing::error!("Failed to close audit session record: {}", e);
             }
         }
     });

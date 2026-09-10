@@ -10,8 +10,14 @@ type MigrationStep = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Ordered, append-only list of schema migrations. Never edit or remove an
 /// entry once released; add a new version instead.
-const MIGRATIONS: &[(u32, &str, MigrationStep)] =
-    &[(1, "baseline schema", Database::migration_v1_baseline)];
+const MIGRATIONS: &[(u32, &str, MigrationStep)] = &[
+    (1, "baseline schema", Database::migration_v1_baseline),
+    (
+        2,
+        "versioned audit sessions/operations/events",
+        crate::audit_events::migration_v2_audit_events,
+    ),
+];
 
 impl Database {
     pub fn open(data_dir: &str) -> Result<Self, rusqlite::Error> {
@@ -348,7 +354,7 @@ mod tests {
             .unwrap();
         }
         let db = Database::open(dir.to_str().unwrap()).unwrap();
-        assert_eq!(db.schema_version(), 1);
+        assert_eq!(db.schema_version(), MIGRATIONS.last().unwrap().0);
         let (alias, idle): (String, i64) = db
             .conn()
             .query_row(

@@ -14,6 +14,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::audit;
+use crate::audit_events;
 use crate::auth;
 use crate::config::limits;
 use crate::crypto;
@@ -515,6 +516,7 @@ struct CreateAdminTerminalRequest {
 
 async fn handle_create_admin_terminal(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     _admin: AdminUser,
     Json(req): Json<CreateAdminTerminalRequest>,
 ) -> impl IntoResponse {
@@ -566,6 +568,33 @@ async fn handle_create_admin_terminal(
     state.helpers.register_local(&session_id).await;
     if !state.sessions.session_exists(&session_id) {
         state.helpers.remove(&session_id).await;
+    }
+    if let Err(e) = audit_events::session_started(
+        &state.db,
+        &audit_events::AuditSession {
+            session_id: session_id.clone(),
+            actor: audit_events::Actor {
+                kind: Some(audit_events::ActorKind::Human),
+                user_id: Some("admin".into()),
+                username: Some("admin".into()),
+                remote_addr: Some(addr.ip().to_string()),
+                ..Default::default()
+            },
+            target: audit_events::Target {
+                server_id: Some("local".into()),
+                server_alias: Some("localhost".into()),
+                server_host: Some("localhost".into()),
+                remote_user: None,
+            },
+            source: audit_events::Source::Terminal,
+            parent_session_id: req.parent_session_id.clone(),
+            connected_at: chrono::Utc::now().to_rfc3339(),
+            disconnected_at: None,
+            disconnect_reason: None,
+            integrity: audit_events::Integrity::Complete,
+        },
+    ) {
+        tracing::error!("Failed to record audit session: {}", e);
     }
 
     let _ = audit::log_connect(
@@ -823,6 +852,7 @@ struct CreateSessionRequest {
 
 async fn handle_create_session(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     Json(req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
@@ -988,6 +1018,33 @@ async fn handle_create_session(
         &server.host,
         &session_id,
     );
+    if let Err(e) = audit_events::session_started(
+        &state.db,
+        &audit_events::AuditSession {
+            session_id: session_id.clone(),
+            actor: audit_events::Actor {
+                kind: Some(audit_events::ActorKind::Human),
+                user_id: Some(user_id.clone()),
+                username: Some(username.clone()),
+                remote_addr: Some(addr.ip().to_string()),
+                ..Default::default()
+            },
+            target: audit_events::Target {
+                server_id: Some(server.id.clone()),
+                server_alias: Some(server.alias.clone()),
+                server_host: Some(server.host.clone()),
+                remote_user: Some(server.username.clone()),
+            },
+            source: audit_events::Source::Terminal,
+            parent_session_id: req.parent_session_id.clone(),
+            connected_at: chrono::Utc::now().to_rfc3339(),
+            disconnected_at: None,
+            disconnect_reason: None,
+            integrity: audit_events::Integrity::Complete,
+        },
+    ) {
+        tracing::error!("Failed to record audit session: {}", e);
+    }
 
     (
         StatusCode::CREATED,
