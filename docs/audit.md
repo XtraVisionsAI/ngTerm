@@ -159,7 +159,7 @@ Rehearse this before relying on it.
 | `GET /api/audit/sessions`, `/api/audit/sessions/{id}` | Session search and detail (operations, recordings). |
 | `GET /api/audit/operations`, `/api/audit/operations/{id}` | Operation search (`q`, `status`, `kind`, `actorKind`, `session`, `server`, `task`, `parent`, time range) and detail with events, recording offset and the lower-level operations it caused (`children`). |
 | `GET /api/audit/sessions/{id}/recordings` | Recording metadata, chunks and verification problems. |
-| `GET /api/audit/recordings/{id}/events` | Playback events (access is recorded). |
+| `GET /api/audit/recordings/{id}/events` | Playback events (access is recorded). `fromSeq`/`toSeq` select a chunk window so the player loads long recordings progressively; the response always lists all chunks and the verification problems of the chunks it read. |
 | `GET /api/audit/export?type=sessions\|operations&format=json\|csv` | Bounded export with the same filters as the lists. |
 | `GET /api/audit/system` | Start/shutdown/retention events (admin). |
 | `GET /api/audit/integrity` | Integrity report (admin, recorded). |

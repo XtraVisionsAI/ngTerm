@@ -440,11 +440,17 @@ pub async fn list_recordings(
 pub struct EventsQuery {
     pub from_ms: Option<u64>,
     pub to_ms: Option<u64>,
+    /// Chunk range (inclusive, 1-based `seq`) for on-demand loading. The
+    /// response always lists every chunk so the player knows what remains.
+    pub from_seq: Option<u32>,
+    pub to_seq: Option<u32>,
 }
 
 /// Events of a recording for playback. Chunks that fail verification are
 /// skipped and reported in `problems`; the caller must show the gap, not
-/// paper over it.
+/// paper over it. With `fromSeq`/`toSeq` only those chunks are read, so a
+/// long recording can be fetched progressively; index gaps are reported for
+/// the whole recording regardless of the window.
 pub async fn recording_events(
     State(state): State<Arc<AppState>>,
     caller: Caller,
@@ -461,9 +467,12 @@ pub async fn recording_events(
     };
     let from = q.from_ms.unwrap_or(0);
     let to = q.to_ms.unwrap_or(u64::MAX);
+    let from_seq = q.from_seq.unwrap_or(0);
+    let to_seq = q.to_seq.unwrap_or(u32::MAX);
     let mut events = Vec::new();
     let mut problems = Vec::new();
     let mut expected = 1u32;
+    let mut chunks_read = 0u32;
     for chunk in &chunks {
         while expected < chunk.seq {
             problems.push(ChunkProblem::IndexGap {
@@ -475,6 +484,10 @@ pub async fn recording_events(
         if chunk.end_ms < from || chunk.start_ms > to {
             continue;
         }
+        if chunk.seq < from_seq || chunk.seq > to_seq {
+            continue;
+        }
+        chunks_read += 1;
         match store.read_chunk(chunk) {
             Ok(evs) => events.extend(
                 evs.into_iter()
@@ -503,6 +516,9 @@ pub async fn recording_events(
             "sessionId": meta.session_id,
             "fromMs": from,
             "toMs": q.to_ms,
+            "fromSeq": q.from_seq,
+            "toSeq": q.to_seq,
+            "chunksRead": chunks_read,
             "events": events.len(),
         }),
     );
@@ -510,6 +526,8 @@ pub async fn recording_events(
         "recording": meta,
         "events": events,
         "problems": problems,
+        "chunks": chunks,
+        "chunksRead": chunks_read,
     }))
     .into_response()
 }
@@ -1017,6 +1035,86 @@ mod tests {
         assert_eq!(access.len(), 1);
         assert_eq!(access[0].event_type, "audit.recording_read");
         assert_eq!(access[0].payload["recordingId"], rid);
+    }
+
+    #[tokio::test]
+    async fn recording_events_can_be_loaded_chunk_by_chunk() {
+        let state = test_state().await;
+        seed_session(&state, "s7", "u1");
+        let store = state.recordings.clone().unwrap();
+        let rec = store.start("s7", 80, 24).unwrap();
+        // 5 × 700 KiB against a 1 MiB chunk limit flushes after the 2nd and
+        // 4th write and once more at finish: at least three chunks.
+        let big = vec![b'x'; 700 * 1024];
+        for _ in 0..5 {
+            rec.output(&big);
+        }
+        let rid = rec.recording_id().to_string();
+        assert_eq!(rec.finish().await, Integrity::Complete);
+
+        let (st, all) = body_json(
+            recording_events(
+                State(state.clone()),
+                user("u1"),
+                Path(rid.clone()),
+                Query(EventsQuery::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let chunks = all["chunks"].as_array().unwrap();
+        assert!(chunks.len() >= 3, "{}", chunks.len());
+        let total_events = all["events"].as_array().unwrap().len();
+        assert_eq!(all["chunksRead"], chunks.len() as u64);
+
+        let (st, first) = body_json(
+            recording_events(
+                State(state.clone()),
+                user("u1"),
+                Path(rid.clone()),
+                Query(EventsQuery {
+                    from_seq: Some(1),
+                    to_seq: Some(1),
+                    ..Default::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(first["chunksRead"], 1);
+        let first_events = first["events"].as_array().unwrap().len();
+        assert!(first_events > 0 && first_events < total_events);
+        assert_eq!(first["chunks"].as_array().unwrap().len(), chunks.len());
+
+        // Windows partition the recording: loading every chunk one range at a
+        // time yields exactly the events of the full read.
+        let mut sum = 0;
+        for c in chunks {
+            let seq = c["seq"].as_u64().unwrap() as u32;
+            let (_, part) = body_json(
+                recording_events(
+                    State(state.clone()),
+                    user("u1"),
+                    Path(rid.clone()),
+                    Query(EventsQuery {
+                        from_seq: Some(seq),
+                        to_seq: Some(seq),
+                        ..Default::default()
+                    }),
+                )
+                .await,
+            )
+            .await;
+            sum += part["events"].as_array().unwrap().len();
+        }
+        assert_eq!(sum, total_events);
+
+        let access = audit_events::events_after(&state.db, ACCESS_STREAM, 0, 50).unwrap();
+        assert!(access
+            .iter()
+            .any(|e| e.payload["fromSeq"] == 1 && e.payload["chunksRead"] == 1));
     }
 
     #[test]

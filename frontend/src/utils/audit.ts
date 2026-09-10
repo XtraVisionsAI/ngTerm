@@ -70,6 +70,15 @@ export interface ChunkProblem {
   detail?: string
 }
 
+/** Chunk metadata as listed by /audit/recordings/{id}/events (`chunks`). */
+export interface RecordingChunk {
+  seq: number
+  startMs: number
+  endMs: number
+  sizeBytes: number
+  eventCount: number
+}
+
 /** One playback event as served by /audit/recordings/{id}/events. */
 export interface RecordedEvent {
   t: number
