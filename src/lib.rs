@@ -1,6 +1,7 @@
 pub mod agent_bridge;
 pub mod ai_tool_registry;
 pub mod audit;
+pub mod audit_api;
 pub mod audit_events;
 pub mod auth;
 pub mod config;

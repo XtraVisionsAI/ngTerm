@@ -110,3 +110,45 @@ impl FromRequestParts<Arc<AppState>> for AuthUserWithSecret {
         })
     }
 }
+
+/// Authenticated caller with role, for endpoints whose data scope depends
+/// on who is asking (audit listings, exports).
+pub struct Caller {
+    pub user_id: String,
+    pub is_admin: bool,
+}
+
+impl Caller {
+    /// Filter value pinning non-admins to their own rows.
+    pub fn scope_user_id(&self) -> Option<String> {
+        if self.is_admin {
+            None
+        } else {
+            Some(self.user_id.clone())
+        }
+    }
+
+    /// Whether a row owned by `owner` is visible to this caller. Rows with
+    /// no owner are admin-only.
+    pub fn can_see(&self, owner: Option<&str>) -> bool {
+        self.is_admin || owner == Some(self.user_id.as_str())
+    }
+}
+
+impl FromRequestParts<Arc<AppState>> for Caller {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let token = extract_token_from_parts(parts)
+            .ok_or_else(|| err_response(StatusCode::UNAUTHORIZED, "Missing token"))?;
+        let (user_id, role) = auth::verify_token(&token, &state.config.jwt_secret)
+            .ok_or_else(|| err_response(StatusCode::UNAUTHORIZED, "Invalid token"))?;
+        Ok(Caller {
+            user_id,
+            is_admin: role == "admin",
+        })
+    }
+}

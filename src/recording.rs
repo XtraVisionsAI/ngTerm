@@ -145,7 +145,9 @@ pub struct RecordedEvent {
 }
 
 impl RecordedEvent {
-    fn to_line(&self) -> String {
+    /// Compact JSON form used both on disk and over the API:
+    /// `{"t":ms,"k":"o|i|r|g|m",...}` with binary payloads base64-encoded.
+    pub fn to_json(&self) -> serde_json::Value {
         let mut v = serde_json::json!({ "t": self.t_ms });
         match &self.kind {
             EventKind::Output(d) => {
@@ -173,7 +175,11 @@ impl RecordedEvent {
                 v["d"] = m.as_str().into();
             }
         }
-        v.to_string()
+        v
+    }
+
+    fn to_line(&self) -> String {
+        self.to_json().to_string()
     }
 
     fn from_line(line: &str) -> Result<Self, String> {

@@ -266,6 +266,23 @@ pub struct OperationFilter {
     pub summary_contains: Option<String>,
 }
 
+/// Filter for session listings. `user_id` is mandatory for non-admins and
+/// enforced by the caller.
+#[derive(Debug, Default, Clone)]
+pub struct SessionFilter {
+    pub user_id: Option<String>,
+    pub username: Option<String>,
+    pub server_id: Option<String>,
+    pub remote_user: Option<String>,
+    pub source: Option<Source>,
+    pub time_from: Option<String>,
+    pub time_to: Option<String>,
+    /// `Some(true)` = still connected, `Some(false)` = ended.
+    pub active: Option<bool>,
+    /// `complete`, `gap` or `truncated`.
+    pub integrity: Option<String>,
+}
+
 fn now() -> String {
     Utc::now().to_rfc3339()
 }
@@ -450,41 +467,126 @@ pub fn session_ended(
     Ok(())
 }
 
+const SESSION_COLUMNS: &str = "session_id, user_id, username, actor_kind, remote_addr, source, server_id, server_alias, server_host, remote_user, parent_session_id, connected_at, disconnected_at, disconnect_reason, integrity, integrity_detail";
+
+fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditSession> {
+    Ok(AuditSession {
+        session_id: r.get(0)?,
+        actor: Actor {
+            user_id: r.get(1)?,
+            username: r.get(2)?,
+            kind: r.get::<_, Option<String>>(3)?.and_then(|s| enum_from(&s)),
+            remote_addr: r.get(4)?,
+            ..Default::default()
+        },
+        source: enum_from(&r.get::<_, String>(5)?).unwrap_or(Source::Api),
+        target: Target {
+            server_id: r.get(6)?,
+            server_alias: r.get(7)?,
+            server_host: r.get(8)?,
+            remote_user: r.get(9)?,
+        },
+        parent_session_id: r.get(10)?,
+        connected_at: r.get(11)?,
+        disconnected_at: r.get(12)?,
+        disconnect_reason: r.get(13)?,
+        integrity: Integrity::from_db(&r.get::<_, String>(14)?, r.get(15)?),
+    })
+}
+
 pub fn get_session(db: &Database, session_id: &str) -> Result<Option<AuditSession>, String> {
     db.conn()
         .query_row(
-            "SELECT session_id, user_id, username, actor_kind, remote_addr, source, server_id, server_alias, server_host, remote_user, parent_session_id, connected_at, disconnected_at, disconnect_reason, integrity, integrity_detail FROM audit_sessions WHERE session_id = ?1",
+            &format!(
+                "SELECT {} FROM audit_sessions WHERE session_id = ?1",
+                SESSION_COLUMNS
+            ),
             params![session_id],
-            |r| {
-                Ok(AuditSession {
-                    session_id: r.get(0)?,
-                    actor: Actor {
-                        user_id: r.get(1)?,
-                        username: r.get(2)?,
-                        kind: r.get::<_, Option<String>>(3)?.and_then(|s| enum_from(&s)),
-                        remote_addr: r.get(4)?,
-                        ..Default::default()
-                    },
-                    source: enum_from(&r.get::<_, String>(5)?).unwrap_or(Source::Api),
-                    target: Target {
-                        server_id: r.get(6)?,
-                        server_alias: r.get(7)?,
-                        server_host: r.get(8)?,
-                        remote_user: r.get(9)?,
-                    },
-                    parent_session_id: r.get(10)?,
-                    connected_at: r.get(11)?,
-                    disconnected_at: r.get(12)?,
-                    disconnect_reason: r.get(13)?,
-                    integrity: Integrity::from_db(&r.get::<_, String>(14)?, r.get(15)?),
-                })
-            },
+            row_to_session,
         )
         .map(Some)
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Ok(None),
             e => Err(e.to_string()),
         })
+}
+
+/// Page of sessions newest first, plus the total matching the filter so
+/// the same query drives both the list and its export.
+pub fn list_sessions(
+    db: &Database,
+    filter: &SessionFilter,
+    limit: u32,
+    offset: u32,
+) -> Result<(Vec<AuditSession>, u32), String> {
+    let mut conds = Vec::new();
+    let mut ps: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut add = |cond: &str, v: Box<dyn rusqlite::types::ToSql>| {
+        ps.push(v);
+        conds.push(cond.replace('?', &format!("?{}", ps.len())));
+    };
+    if let Some(v) = &filter.user_id {
+        add("user_id = ?", Box::new(v.clone()));
+    }
+    if let Some(v) = &filter.username {
+        add("username = ?", Box::new(v.clone()));
+    }
+    if let Some(v) = &filter.server_id {
+        add("server_id = ?", Box::new(v.clone()));
+    }
+    if let Some(v) = &filter.remote_user {
+        add("remote_user = ?", Box::new(v.clone()));
+    }
+    if let Some(v) = &filter.source {
+        add("source = ?", Box::new(enum_str(v)));
+    }
+    if let Some(v) = &filter.time_from {
+        add("connected_at >= ?", Box::new(v.clone()));
+    }
+    if let Some(v) = &filter.time_to {
+        add("connected_at <= ?", Box::new(v.clone()));
+    }
+    if let Some(v) = &filter.integrity {
+        add("integrity = ?", Box::new(v.clone()));
+    }
+    match filter.active {
+        Some(true) => conds.push("disconnected_at IS NULL".to_string()),
+        Some(false) => conds.push("disconnected_at IS NOT NULL".to_string()),
+        None => {}
+    }
+    let where_clause = if conds.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conds.join(" AND "))
+    };
+
+    let conn = db.conn();
+    let refs: Vec<&dyn rusqlite::types::ToSql> = ps.iter().map(|p| p.as_ref()).collect();
+    let total: u32 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM audit_sessions {}", where_clause),
+            refs.as_slice(),
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+
+    ps.push(Box::new(limit));
+    let li = ps.len();
+    ps.push(Box::new(offset));
+    let oi = ps.len();
+    let refs: Vec<&dyn rusqlite::types::ToSql> = ps.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {} FROM audit_sessions {} ORDER BY connected_at DESC LIMIT ?{} OFFSET ?{}",
+            SESSION_COLUMNS, where_clause, li, oi
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(refs.as_slice(), row_to_session)
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok((rows, total))
 }
 
 /// Register an operation *before* it executes. Returns the operation id the
@@ -779,26 +881,43 @@ pub fn events_after(
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map(params![stream_id, after_seq, limit], |r| {
-            Ok(AuditEvent {
-                event_id: r.get(0)?,
-                schema_version: r.get::<_, i64>(1)? as u32,
-                stream_id: r.get(2)?,
-                seq: r.get(3)?,
-                occurred_at: r.get(4)?,
-                recorded_at: r.get(5)?,
-                session_id: r.get(6)?,
-                operation_id: r.get(7)?,
-                event_type: r.get(8)?,
-                payload: serde_json::from_str(&r.get::<_, String>(9)?)
-                    .unwrap_or(serde_json::Value::Null),
-                integrity: Integrity::from_db(&r.get::<_, String>(10)?, r.get(11)?),
-            })
-        })
+        .query_map(params![stream_id, after_seq, limit], row_to_event)
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .collect();
     Ok(rows)
+}
+
+/// All events linked to one operation, in recording order.
+pub fn events_for_operation(db: &Database, operation_id: &str) -> Result<Vec<AuditEvent>, String> {
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare(
+            "SELECT event_id, schema_version, stream_id, seq, occurred_at, recorded_at, session_id, operation_id, event_type, payload, integrity, integrity_detail FROM audit_events WHERE operation_id = ?1 ORDER BY recorded_at ASC, seq ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![operation_id], row_to_event)
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
+    Ok(AuditEvent {
+        event_id: r.get(0)?,
+        schema_version: r.get::<_, i64>(1)? as u32,
+        stream_id: r.get(2)?,
+        seq: r.get(3)?,
+        occurred_at: r.get(4)?,
+        recorded_at: r.get(5)?,
+        session_id: r.get(6)?,
+        operation_id: r.get(7)?,
+        event_type: r.get(8)?,
+        payload: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or(serde_json::Value::Null),
+        integrity: Integrity::from_db(&r.get::<_, String>(10)?, r.get(11)?),
+    })
 }
 
 #[cfg(test)]

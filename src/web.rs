@@ -14,6 +14,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::audit;
+use crate::audit_api;
 use crate::audit_events;
 use crate::auth;
 use crate::config::limits;
@@ -147,6 +148,19 @@ pub fn build_router_with_hooks(state: Arc<AppState>, hooks: RouterHooks) -> Rout
         // Audit
         .route("/audit/logs", get(handle_list_audit_logs))
         .route("/audit/filters", get(handle_audit_filters))
+        .route("/audit/sessions", get(audit_api::list_sessions))
+        .route("/audit/sessions/{id}", get(audit_api::get_session))
+        .route(
+            "/audit/sessions/{id}/recordings",
+            get(audit_api::list_recordings),
+        )
+        .route("/audit/operations", get(audit_api::list_operations))
+        .route("/audit/operations/{id}", get(audit_api::get_operation))
+        .route(
+            "/audit/recordings/{id}/events",
+            get(audit_api::recording_events),
+        )
+        .route("/audit/export", get(audit_api::export))
         // UI State
         .route("/ui-state", get(handle_get_ui_state))
         .route("/ui-state", put(handle_save_ui_state));
