@@ -29,7 +29,7 @@ NGTerm is a single-binary SSH gateway that sits on your jump host and provides b
 - **Multi-Tab & Split Panes** — multiple servers in labeled tabs; split any terminal horizontally/vertically (Ctrl+Shift+D/E/W), layout survives page refresh
 - **File Explorer (SFTP)** — browse, upload, download, and edit remote files from the browser
 - **Git Panel** — status, log, branches, and diff for repositories on the remote machine
-- **Audit Logs** — connection and session history with filtering
+- **Audit & Recording** — every session is recorded (output, resizes, input metadata) in hashed, append-only chunks; platform-executed file/git/config operations are registered before they run and closed with a truthful outcome; search, export and replay with per-user scoping. See [docs/audit.md](docs/audit.md)
 - **Admin Terminal** — local shell on the jump host for administrators, with the same split-pane experience
 - **Three-Level Tool Config** — admin defines AI tool templates; users and per-server settings override them; secrets encrypted per user
 - **Single Binary** — frontend embedded via rust-embed; one file to deploy, zero runtime dependencies
@@ -131,13 +131,21 @@ Options:
       --default-cols <COLS>      Default terminal columns [default: 120]
       --default-rows <ROWS>      Default terminal rows [default: 36]
       --master-key <KEY>         Set master key on first run (ignored after init)
+      --backup-to <DIR>          Write a consistent audit backup into an empty directory and exit
 ```
+
+Audit and recording behaviour is configured through environment variables
+(`NGTERM_RECORDING`, `NGTERM_RECORDING_INPUT`, `NGTERM_RECORDING_MAX_MB`,
+`NGTERM_RECORDING_RETENTION_DAYS`, `NGTERM_AUDIT_RETENTION_DAYS`); see
+[docs/audit.md](docs/audit.md) for what is recorded, who can read it, the
+integrity checks and their limits, and the backup/restore procedure.
 
 ## Deployment
 
 - **Sizing**: 2 vCPU / 2 GB RAM is sufficient for ≈10 servers / a handful of concurrent users
 - **Network**: only expose 443 (HTTPS) + 22 (management SSH); put nginx or Caddy in front for TLS
-- **systemd**: run as a non-root user; keep `--data-dir` on a restricted-permission path (it holds the SQLite DB and `.env`)
+- **systemd**: run as a non-root user; keep `--data-dir` on a restricted-permission path (it holds the SQLite DB, `.env` and `recordings/`)
+- **Backups**: schedule `ngterm --data-dir <DIR> --backup-to <EMPTY-DIR>` and copy the result off-host; back up `.env` separately through your secret store (see [docs/audit.md](docs/audit.md))
 
 ## License
 
