@@ -3,6 +3,7 @@ pub mod ai_tool_registry;
 pub mod audit;
 pub mod audit_api;
 pub mod audit_events;
+pub mod audit_ops;
 pub mod auth;
 pub mod config;
 pub mod crypto;

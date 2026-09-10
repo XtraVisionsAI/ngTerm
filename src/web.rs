@@ -16,6 +16,8 @@ use tower_http::trace::TraceLayer;
 use crate::audit;
 use crate::audit_api;
 use crate::audit_events;
+use crate::audit_events::OperationKind;
+use crate::audit_ops::{self, OpError};
 use crate::auth;
 use crate::config::limits;
 use crate::crypto;
@@ -1181,6 +1183,23 @@ fn extract_user_id(headers: &axum::http::HeaderMap, jwt_secret: &[u8]) -> Option
     extract_token(headers).and_then(|t| auth::verify_token(&t, jwt_secret).map(|(uid, _)| uid))
 }
 
+/// HTTP status for a managed operation that did not succeed: 503 when the
+/// audit intent could not be written (nothing ran), 500 when it ran and failed.
+fn op_error_response(e: OpError) -> axum::response::Response {
+    match e {
+        OpError::AuditRefused(msg) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError { error: msg }),
+        )
+            .into_response(),
+        OpError::Failed(msg) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: msg }),
+        )
+            .into_response(),
+    }
+}
+
 fn is_admin(headers: &axum::http::HeaderMap, jwt_secret: &[u8]) -> bool {
     extract_token(headers)
         .and_then(|t| auth::verify_token(&t, jwt_secret))
@@ -1360,7 +1379,17 @@ async fn handle_read_file(
         }
     }
 
-    match state.helpers.sftp_read(&session_id, &query.path).await {
+    match audit_ops::run(
+        &state,
+        &session_id,
+        &user_id,
+        OperationKind::FileRead,
+        format!("read {}", query.path),
+        None,
+        state.helpers.sftp_read(&session_id, &query.path),
+    )
+    .await
+    {
         Ok(data) => {
             if data.len() as u64 > limits::MAX_PREVIEW_BYTES {
                 return (
@@ -1374,11 +1403,7 @@ async fn handle_read_file(
             let content = String::from_utf8_lossy(&data).to_string();
             Json(serde_json::json!({ "content": content })).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+        Err(e) => op_error_response(e),
     }
 }
 
@@ -1402,17 +1427,22 @@ async fn handle_write_file(
         return (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response();
     }
 
-    match state
-        .helpers
-        .sftp_write(&session_id, &req.path, req.content.as_bytes())
-        .await
+    let summary = format!("write {} ({} bytes)", req.path, req.content.len());
+    match audit_ops::run(
+        &state,
+        &session_id,
+        &user_id,
+        OperationKind::FileWrite,
+        summary,
+        None,
+        state
+            .helpers
+            .sftp_write(&session_id, &req.path, req.content.as_bytes()),
+    )
+    .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+        Err(e) => op_error_response(e),
     }
 }
 
@@ -1432,13 +1462,19 @@ async fn handle_delete_file(
         return (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response();
     }
 
-    match state.helpers.sftp_delete(&session_id, &query.path).await {
+    match audit_ops::run(
+        &state,
+        &session_id,
+        &user_id,
+        OperationKind::FileDelete,
+        format!("delete {}", query.path),
+        None,
+        state.helpers.sftp_delete(&session_id, &query.path),
+    )
+    .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+        Err(e) => op_error_response(e),
     }
 }
 
@@ -1462,13 +1498,19 @@ async fn handle_mkdir(
         return (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response();
     }
 
-    match state.helpers.sftp_mkdir(&session_id, &req.path).await {
+    match audit_ops::run(
+        &state,
+        &session_id,
+        &user_id,
+        OperationKind::Mkdir,
+        format!("mkdir {}", req.path),
+        None,
+        state.helpers.sftp_mkdir(&session_id, &req.path),
+    )
+    .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+        Err(e) => op_error_response(e),
     }
 }
 
@@ -1495,17 +1537,19 @@ async fn handle_rename_file(
         return (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response();
     }
 
-    match state
-        .helpers
-        .sftp_rename(&session_id, &req.from, &req.to)
-        .await
+    match audit_ops::run(
+        &state,
+        &session_id,
+        &user_id,
+        OperationKind::FileRename,
+        format!("rename {} -> {}", req.from, req.to),
+        None,
+        state.helpers.sftp_rename(&session_id, &req.from, &req.to),
+    )
+    .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+        Err(e) => op_error_response(e),
     }
 }
 
@@ -1580,15 +1624,21 @@ async fn handle_download_file(
         .map(|s| s.size)
         .unwrap_or(0);
 
-    let file = match state.helpers.open_read(&session_id, &query.path).await {
+    // Recorded when the remote file is opened: the transfer itself streams
+    // after the response starts and its completion is not observed here.
+    let file = match audit_ops::run(
+        &state,
+        &session_id,
+        &user_id,
+        OperationKind::Download,
+        format!("download {} ({} bytes)", query.path, file_size),
+        None,
+        state.helpers.open_read(&session_id, &query.path),
+    )
+    .await
+    {
         Ok(f) => f,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError { error: e }),
-            )
-                .into_response()
-        }
+        Err(e) => return op_error_response(e),
     };
 
     let filename = std::path::Path::new(&query.path)
@@ -1648,9 +1698,21 @@ async fn handle_upload_file(
         let file_name = field.file_name().unwrap_or("unnamed").to_string();
         let remote_path = format!("{}/{}", upload_dir.trim_end_matches('/'), file_name);
 
+        let managed = match audit_ops::begin(
+            &state,
+            &session_id,
+            &user_id,
+            OperationKind::Upload,
+            format!("upload {}", remote_path),
+            None,
+        ) {
+            Ok(m) => m,
+            Err(e) => return op_error_response(OpError::AuditRefused(e)),
+        };
         let mut file = match state.helpers.open_write(&session_id, &remote_path).await {
             Ok(f) => f,
             Err(e) => {
+                managed.failed(&e);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiError { error: e }),
@@ -1676,12 +1738,14 @@ async fn handle_upload_file(
         }
 
         if let Some(e) = write_err {
+            managed.failed(&e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiError { error: e }),
             )
                 .into_response();
         }
+        managed.succeeded();
 
         uploaded.push(serde_json::json!({
             "name": file_name,
@@ -1713,7 +1777,17 @@ async fn handle_git_status(
     }
 
     let cmd = "git status --porcelain 2>/dev/null && echo '---BRANCH---' && git branch --show-current 2>/dev/null";
-    match state.helpers.exec(&session_id, cmd).await {
+    match audit_ops::run(
+        &state,
+        &session_id,
+        &user_id,
+        OperationKind::Git,
+        cmd.to_string(),
+        None,
+        state.helpers.exec(&session_id, cmd),
+    )
+    .await
+    {
         Ok(output) => {
             let parts: Vec<&str> = output.splitn(2, "---BRANCH---").collect();
             let files: Vec<serde_json::Value> = parts
@@ -1730,11 +1804,7 @@ async fn handle_git_status(
             let branch = parts.get(1).unwrap_or(&"").trim().to_string();
             Json(serde_json::json!({ "branch": branch, "files": files })).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+        Err(e) => op_error_response(e),
     }
 }
 
@@ -1756,7 +1826,17 @@ async fn handle_git_log(
         "git log --oneline --decorate --format='%H|||%h|||%s|||%an|||%ar|||%D' -n {} 2>/dev/null",
         limit
     );
-    match state.helpers.exec(&session_id, &cmd).await {
+    match audit_ops::run(
+        &state,
+        &session_id,
+        &user_id,
+        OperationKind::Git,
+        cmd.clone(),
+        None,
+        state.helpers.exec(&session_id, &cmd),
+    )
+    .await
+    {
         Ok(output) => {
             let commits: Vec<serde_json::Value> = output
                 .lines()
@@ -1775,11 +1855,7 @@ async fn handle_git_log(
                 .collect();
             Json(commits).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+        Err(e) => op_error_response(e),
     }
 }
 
@@ -1796,7 +1872,17 @@ async fn handle_git_branches(
     }
 
     let cmd = "git branch -a --format='%(refname:short)|||%(HEAD)|||%(upstream:short)' 2>/dev/null";
-    match state.helpers.exec(&session_id, cmd).await {
+    match audit_ops::run(
+        &state,
+        &session_id,
+        &user_id,
+        OperationKind::Git,
+        cmd.to_string(),
+        None,
+        state.helpers.exec(&session_id, cmd),
+    )
+    .await
+    {
         Ok(output) => {
             let branches: Vec<serde_json::Value> = output
                 .lines()
@@ -1815,11 +1901,7 @@ async fn handle_git_branches(
                 .collect();
             Json(branches).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+        Err(e) => op_error_response(e),
     }
 }
 
@@ -1836,13 +1918,19 @@ async fn handle_git_diff(
     }
 
     let cmd = "git diff 2>/dev/null";
-    match state.helpers.exec(&session_id, cmd).await {
+    match audit_ops::run(
+        &state,
+        &session_id,
+        &user_id,
+        OperationKind::Git,
+        cmd.to_string(),
+        None,
+        state.helpers.exec(&session_id, cmd),
+    )
+    .await
+    {
         Ok(diff) => Json(serde_json::json!({ "diff": diff })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+        Err(e) => op_error_response(e),
     }
 }
 
