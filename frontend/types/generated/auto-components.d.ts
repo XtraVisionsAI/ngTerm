@@ -16,6 +16,7 @@ declare module 'vue' {
     AuditConnections: typeof import('./../../src/pages/audit/components/audit-connections.vue')['default']
     AuditOperations: typeof import('./../../src/pages/audit/components/audit-operations.vue')['default']
     AuditSessions: typeof import('./../../src/pages/audit/components/audit-sessions.vue')['default']
+    ConfigChangeDetail: typeof import('./../../src/pages/audit/components/config-change-detail.vue')['default']
     ConnectionList: typeof import('./../../src/components/sidebar/ConnectionList.vue')['default']
     CredentialList: typeof import('./../../src/components/sidebar/CredentialList.vue')['default']
     FileExplorer: typeof import('./../../src/components/file-explorer/FileExplorer.vue')['default']

@@ -101,6 +101,13 @@ declare module 'vue-router/auto-routes' {
       Record<never, never>,
       | never
     >,
+    '/audit/components/config-change-detail': RouteRecordInfo<
+      '/audit/components/config-change-detail',
+      '/audit/components/config-change-detail',
+      Record<never, never>,
+      Record<never, never>,
+      | never
+    >,
     '/audit/recordings/[id]': RouteRecordInfo<
       '/audit/recordings/[id]',
       '/audit/recordings/:id',
@@ -210,6 +217,14 @@ declare module 'vue-router/auto-routes' {
     'src/pages/audit/components/audit-sessions.vue': {
       routes:
         | '/audit/components/audit-sessions'
+      views:
+        | never
+      pathParamNames:
+        | never
+    }
+    'src/pages/audit/components/config-change-detail.vue': {
+      routes:
+        | '/audit/components/config-change-detail'
       views:
         | never
       pathParamNames:

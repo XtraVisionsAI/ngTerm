@@ -14,7 +14,7 @@
   const api = useApi()
   const message = useMessage()
 
-  const recordingId = route.params.id as string
+  const recordingId = (route.params as { id: string }).id
   const container = ref<HTMLElement | null>(null)
 
   const meta = ref<RecordingMeta | null>(null)

@@ -15,13 +15,14 @@ use tower_http::trace::TraceLayer;
 
 use crate::audit;
 use crate::audit_api;
+use crate::audit_config::{self, Action, Applied, Change, ObjectKind};
 use crate::audit_events;
 use crate::audit_events::OperationKind;
 use crate::audit_ops::{self, OpError};
 use crate::auth;
 use crate::config::limits;
 use crate::crypto;
-use crate::extractors::{AdminUser, AuthUser};
+use crate::extractors::{AdminUser, AuthUser, Caller};
 use crate::key_manager::{self, CreateKeyRequest};
 use crate::server_registry::{self, CreateServerRequest};
 use crate::ssh_bridge;
@@ -385,24 +386,30 @@ struct ChangePasswordRequest {
 
 async fn handle_change_password(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    caller: Caller,
     Json(req): Json<ChangePasswordRequest>,
 ) -> impl IntoResponse {
-    let user_id = match extract_user_id(&headers, &state.config.jwt_secret) {
-        Some(uid) => uid,
-        None => return StatusCode::UNAUTHORIZED.into_response(),
-    };
-
+    let user_id = caller.user_id.clone();
     let cp_state = state.clone();
     let uid = user_id.clone();
-    let result = auth::run_blocking(move || {
-        auth::change_password(
-            &cp_state.db,
-            &uid,
-            &req.old_password,
-            &req.new_password,
-            &cp_state.config.pepper,
-        )
+    let change = Change::new(
+        ObjectKind::User,
+        Action::PasswordChange,
+        "change own password",
+    )
+    .object_id(&user_id);
+    let result = audit_config::run(&state, &caller, change, async move {
+        auth::run_blocking(move || {
+            auth::change_password(
+                &cp_state.db,
+                &uid,
+                &req.old_password,
+                &req.new_password,
+                &cp_state.config.pepper,
+            )
+        })
+        .await
+        .map(Applied::new)
     })
     .await;
     match result {
@@ -411,7 +418,7 @@ async fn handle_change_password(
             Json(serde_json::json!({"message": "Password changed. Please login again."}))
                 .into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response(),
+        Err(e) => config_error_response(e, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -448,6 +455,7 @@ async fn handle_list_users(
 async fn handle_create_user(
     State(state): State<Arc<AppState>>,
     _admin: AdminUser,
+    caller: Caller,
     Json(req): Json<CreateUserRequest>,
 ) -> impl IntoResponse {
     let password = req.password.unwrap_or_else(|| {
@@ -456,8 +464,23 @@ async fn handle_create_user(
     });
     let cu_state = state.clone();
     let username = req.username.clone();
-    let result = auth::run_blocking(move || {
-        auth::create_user(&cu_state.db, &username, &password, &cu_state.config.pepper)
+    let snapshot_name = req.username.clone();
+    let change = Change::new(
+        ObjectKind::User,
+        Action::Create,
+        format!("create user {}", req.username),
+    );
+    let result = audit_config::run(&state, &caller, change, async move {
+        let (user_id, pwd) = auth::run_blocking(move || {
+            auth::create_user(&cu_state.db, &username, &password, &cu_state.config.pepper)
+        })
+        .await?;
+        let after = audit_config::user_snapshot(&serde_json::json!({
+            "id": user_id, "username": snapshot_name, "role": "user"
+        }));
+        Ok(Applied::new((user_id.clone(), pwd))
+            .object_id(user_id)
+            .after(Some(after)))
     })
     .await;
     match result {
@@ -466,23 +489,53 @@ async fn handle_create_user(
             Json(serde_json::json!({"userId": user_id, "username": req.username, "password": pwd})),
         )
             .into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response(),
+        Err(e) => config_error_response(e, StatusCode::BAD_REQUEST),
     }
+}
+
+/// Redacted snapshot of a user row (id, username, role), if the user exists.
+fn user_snapshot_by_id(state: &AppState, id: &str) -> Option<serde_json::Value> {
+    auth::list_users(&state.db)
+        .ok()?
+        .into_iter()
+        .find(|u| u.get("id").and_then(|v| v.as_str()) == Some(id))
+        .map(|u| audit_config::user_snapshot(&u))
+}
+
+fn username_from_snapshot(snapshot: &Option<serde_json::Value>, fallback: &str) -> String {
+    snapshot
+        .as_ref()
+        .and_then(|s| s.get("username"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 async fn handle_delete_user(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     _admin: AdminUser,
+    caller: Caller,
 ) -> impl IntoResponse {
-    match auth::delete_user(&state.db, &id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+    let before = user_snapshot_by_id(&state, &id);
+    let change = Change::new(
+        ObjectKind::User,
+        Action::Delete,
+        format!("delete user {}", username_from_snapshot(&before, &id)),
+    )
+    .object_id(&id)
+    .before(before);
+    let result = audit_config::run(&state, &caller, change, async {
+        match auth::delete_user(&state.db, &id) {
+            Ok(true) => Ok(Applied::new(())),
+            Ok(false) => Err(NOT_FOUND.to_string()),
+            Err(e) => Err(e),
+        }
+    })
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => config_error_response(e, StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -496,17 +549,33 @@ async fn handle_reset_user_password(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     _admin: AdminUser,
+    caller: Caller,
     Json(req): Json<ResetPasswordRequest>,
 ) -> impl IntoResponse {
     let rp_state = state.clone();
     let uid = id.clone();
-    let result = auth::run_blocking(move || {
-        auth::admin_reset_password(
-            &rp_state.db,
-            &uid,
-            &req.new_password,
-            &rp_state.config.pepper,
-        )
+    let before = user_snapshot_by_id(&state, &id);
+    let change = Change::new(
+        ObjectKind::User,
+        Action::PasswordReset,
+        format!(
+            "reset password of user {}",
+            username_from_snapshot(&before, &id)
+        ),
+    )
+    .object_id(&id);
+    let result = audit_config::run(&state, &caller, change, async move {
+        auth::run_blocking(move || {
+            auth::admin_reset_password(
+                &rp_state.db,
+                &uid,
+                &req.new_password,
+                &rp_state.config.pepper,
+            )
+        })
+        .await?;
+        // The password itself is never part of the record; the side effect is.
+        Ok(Applied::new(()).after(Some(serde_json::json!({ "sshKeysCleared": true }))))
     })
     .await;
     match result {
@@ -515,7 +584,7 @@ async fn handle_reset_user_password(
             Json(serde_json::json!({"message": "Password reset. User's SSH keys have been cleared."}))
                 .into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response(),
+        Err(e) => config_error_response(e, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -657,6 +726,7 @@ struct ServerQuery {
 
 async fn handle_list_servers(
     State(state): State<Arc<AppState>>,
+    _user: AuthUser,
     Query(q): Query<ServerQuery>,
 ) -> impl IntoResponse {
     match server_registry::list_servers(&state.db, q.group_name.as_deref()) {
@@ -671,42 +741,114 @@ async fn handle_list_servers(
 
 async fn handle_create_server(
     State(state): State<Arc<AppState>>,
+    caller: Caller,
     Json(req): Json<CreateServerRequest>,
 ) -> impl IntoResponse {
-    match server_registry::create_server(&state.db, &req) {
+    let change = Change::new(
+        ObjectKind::Server,
+        Action::Create,
+        format!(
+            "create server {} ({}@{})",
+            req.alias, req.username, req.host
+        ),
+    )
+    .target(audit_events::Target {
+        server_alias: Some(req.alias.clone()),
+        server_host: Some(req.host.clone()),
+        remote_user: Some(req.username.clone()),
+        ..Default::default()
+    });
+    let result = audit_config::run(&state, &caller, change, async {
+        let server = server_registry::create_server(&state.db, &req)?;
+        Ok(Applied::new(server.clone())
+            .object_id(server.id.clone())
+            .after(Some(audit_config::server_snapshot(&server))))
+    })
+    .await;
+    match result {
         Ok(server) => (StatusCode::CREATED, Json(server)).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response(),
+        Err(e) => config_error_response(e, StatusCode::BAD_REQUEST),
     }
 }
 
 async fn handle_delete_server(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    caller: Caller,
 ) -> impl IntoResponse {
-    match server_registry::delete_server(&state.db, &id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+    let existing = server_registry::get_server(&state.db, &id).ok().flatten();
+    let alias = existing
+        .as_ref()
+        .map(|s| s.alias.clone())
+        .unwrap_or_else(|| id.clone());
+    let change = Change::new(
+        ObjectKind::Server,
+        Action::Delete,
+        format!("delete server {}", alias),
+    )
+    .object_id(&id)
+    .target(
+        existing
+            .as_ref()
+            .map(audit_config::server_target)
+            .unwrap_or_default(),
+    )
+    .before(existing.as_ref().map(audit_config::server_snapshot));
+    let result = audit_config::run(&state, &caller, change, async {
+        match server_registry::delete_server(&state.db, &id) {
+            Ok(true) => Ok(Applied::new(())),
+            Ok(false) => Err(NOT_FOUND.to_string()),
+            Err(e) => Err(e),
+        }
+    })
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => config_error_response(e, StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
 async fn handle_update_server(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    caller: Caller,
     Json(req): Json<server_registry::UpdateServerRequest>,
 ) -> impl IntoResponse {
-    match server_registry::update_server(&state.db, &id, &req) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+    let existing = server_registry::get_server(&state.db, &id).ok().flatten();
+    let alias = existing
+        .as_ref()
+        .map(|s| s.alias.clone())
+        .unwrap_or_else(|| id.clone());
+    let change = Change::new(
+        ObjectKind::Server,
+        Action::Update,
+        format!("update server {}", alias),
+    )
+    .object_id(&id)
+    .target(
+        existing
+            .as_ref()
+            .map(audit_config::server_target)
+            .unwrap_or_default(),
+    )
+    .before(existing.as_ref().map(audit_config::server_snapshot));
+    let result = audit_config::run(&state, &caller, change, async {
+        match server_registry::update_server(&state.db, &id, &req) {
+            Ok(true) => {
+                let after = server_registry::get_server(&state.db, &id)
+                    .ok()
+                    .flatten()
+                    .map(|s| audit_config::server_snapshot(&s));
+                Ok(Applied::new(()).after(after))
+            }
+            Ok(false) => Err(NOT_FOUND.to_string()),
+            Err(e) => Err(e),
+        }
+    })
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => config_error_response(e, StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -799,52 +941,75 @@ async fn handle_list_keys(
 
 async fn handle_create_key(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    caller: Caller,
     Json(req): Json<CreateKeyRequest>,
 ) -> impl IntoResponse {
-    let user_id = match extract_user_id(&headers, &state.config.jwt_secret) {
-        Some(uid) => uid,
-        None => return StatusCode::UNAUTHORIZED.into_response(),
-    };
-
+    let user_id = caller.user_id.clone();
     let user_secret = match state.auth_sessions.read().await.get_user_secret(&user_id) {
         Some(key) => key,
         None => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
-    match key_manager::create_key(
-        &state.db,
-        &user_id,
-        &user_secret,
-        &req.name,
-        &req.private_key,
-    ) {
-        Ok(info) => {
-            tracing::info!(
-                "Key created: id={}, pem_len={}, first_line='{}'",
-                info.id,
-                req.private_key.len(),
-                req.private_key.lines().next().unwrap_or("")
-            );
-            (StatusCode::CREATED, Json(info)).into_response()
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response(),
+    let change = Change::new(
+        ObjectKind::SshKey,
+        Action::Create,
+        format!("add ssh key {}", req.name),
+    );
+    let result = audit_config::run(&state, &caller, change, async {
+        let info = key_manager::create_key(
+            &state.db,
+            &user_id,
+            &user_secret,
+            &req.name,
+            &req.private_key,
+        )?;
+        tracing::info!("Key created: id={}, type={}", info.id, info.key_type);
+        let after = audit_config::key_snapshot(&info);
+        Ok(Applied::new(info)
+            .object_id(after["id"].as_str().unwrap_or_default().to_string())
+            .after(Some(after)))
+    })
+    .await;
+    match result {
+        Ok(info) => (StatusCode::CREATED, Json(info)).into_response(),
+        Err(e) => config_error_response(e, StatusCode::BAD_REQUEST),
     }
 }
 
 async fn handle_delete_key(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    AuthUser(user_id): AuthUser,
+    caller: Caller,
 ) -> impl IntoResponse {
-    match key_manager::delete_key(&state.db, &user_id, &id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+    let user_id = caller.user_id.clone();
+    let before = key_manager::list_keys(&state.db, &user_id)
+        .ok()
+        .and_then(|keys| keys.into_iter().find(|k| k.id == id))
+        .map(|k| audit_config::key_snapshot(&k));
+    let name = before
+        .as_ref()
+        .and_then(|b| b.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(&id)
+        .to_string();
+    let change = Change::new(
+        ObjectKind::SshKey,
+        Action::Delete,
+        format!("delete ssh key {}", name),
+    )
+    .object_id(&id)
+    .before(before);
+    let result = audit_config::run(&state, &caller, change, async {
+        match key_manager::delete_key(&state.db, &user_id, &id) {
+            Ok(true) => Ok(Applied::new(())),
+            Ok(false) => Err(NOT_FOUND.to_string()),
+            Err(e) => Err(e),
+        }
+    })
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => config_error_response(e, StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -1185,6 +1350,21 @@ fn extract_user_id(headers: &axum::http::HeaderMap, jwt_secret: &[u8]) -> Option
 
 /// HTTP status for a managed operation that did not succeed: 503 when the
 /// audit intent could not be written (nothing ran), 500 when it ran and failed.
+/// Sentinel error for "the object does not exist": recorded as a failed
+/// change, answered with 404.
+const NOT_FOUND: &str = "not found";
+
+/// Like [`op_error_response`], but a failed configuration change answers
+/// with `status` (usually 400 for validation problems, 404 for missing
+/// objects) instead of 500.
+fn config_error_response(e: OpError, status: StatusCode) -> axum::response::Response {
+    match e {
+        OpError::Failed(msg) if msg == NOT_FOUND => StatusCode::NOT_FOUND.into_response(),
+        OpError::Failed(msg) => (status, Json(ApiError { error: msg })).into_response(),
+        refused => op_error_response(refused),
+    }
+}
+
 fn op_error_response(e: OpError) -> axum::response::Response {
     match e {
         OpError::AuditRefused(msg) => (
@@ -2291,11 +2471,32 @@ async fn handle_list_tools(
 async fn handle_create_tool(
     State(state): State<Arc<AppState>>,
     _admin: AdminUser,
+    caller: Caller,
     Json(req): Json<crate::ai_tool_registry::CreateAiToolRequest>,
 ) -> impl IntoResponse {
-    match crate::ai_tool_registry::create_tool(&state.db, &req) {
-        Ok(tool) => (StatusCode::CREATED, Json(tool)).into_response(),
-        Err(e) => registry_error_response(e),
+    let change = Change::new(
+        ObjectKind::AiTool,
+        Action::Create,
+        format!("create ai tool {} ({})", req.name, req.tool_type),
+    );
+    let mut registry_err = None;
+    let result = audit_config::run(&state, &caller, change, async {
+        match crate::ai_tool_registry::create_tool(&state.db, &req) {
+            Ok(tool) => Ok(Applied::new(tool.clone())
+                .object_id(tool.id.clone())
+                .after(Some(audit_config::tool_snapshot(&tool)))),
+            Err(e) => {
+                let msg = e.to_string();
+                registry_err = Some(e);
+                Err(msg)
+            }
+        }
+    })
+    .await;
+    match (result, registry_err) {
+        (Ok(tool), _) => (StatusCode::CREATED, Json(tool)).into_response(),
+        (Err(OpError::Failed(_)), Some(e)) => registry_error_response(e),
+        (Err(e), _) => config_error_response(e, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -2325,12 +2526,46 @@ async fn handle_update_tool(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     _admin: AdminUser,
+    caller: Caller,
     Json(req): Json<crate::ai_tool_registry::UpdateAiToolRequest>,
 ) -> impl IntoResponse {
-    match crate::ai_tool_registry::update_tool(&state.db, &id, &req) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => registry_error_response(e),
+    let existing = crate::ai_tool_registry::get_tool(&state.db, &id)
+        .ok()
+        .flatten();
+    let name = existing
+        .as_ref()
+        .map(|t| t.name.clone())
+        .unwrap_or_else(|| id.clone());
+    let change = Change::new(
+        ObjectKind::AiTool,
+        Action::Update,
+        format!("update ai tool {}", name),
+    )
+    .object_id(&id)
+    .before(existing.as_ref().map(audit_config::tool_snapshot));
+    let mut registry_err = None;
+    let result = audit_config::run(&state, &caller, change, async {
+        match crate::ai_tool_registry::update_tool(&state.db, &id, &req) {
+            Ok(true) => {
+                let after = crate::ai_tool_registry::get_tool(&state.db, &id)
+                    .ok()
+                    .flatten()
+                    .map(|t| audit_config::tool_snapshot(&t));
+                Ok(Applied::new(()).after(after))
+            }
+            Ok(false) => Err(NOT_FOUND.to_string()),
+            Err(e) => {
+                let msg = e.to_string();
+                registry_err = Some(e);
+                Err(msg)
+            }
+        }
+    })
+    .await;
+    match (result, registry_err) {
+        (Ok(()), _) => StatusCode::NO_CONTENT.into_response(),
+        (Err(OpError::Failed(_)), Some(e)) => registry_error_response(e),
+        (Err(e), _) => config_error_response(e, StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -2338,15 +2573,33 @@ async fn handle_delete_tool(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     _admin: AdminUser,
+    caller: Caller,
 ) -> impl IntoResponse {
-    match crate::ai_tool_registry::delete_tool(&state.db, &id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+    let existing = crate::ai_tool_registry::get_tool(&state.db, &id)
+        .ok()
+        .flatten();
+    let name = existing
+        .as_ref()
+        .map(|t| t.name.clone())
+        .unwrap_or_else(|| id.clone());
+    let change = Change::new(
+        ObjectKind::AiTool,
+        Action::Delete,
+        format!("delete ai tool {}", name),
+    )
+    .object_id(&id)
+    .before(existing.as_ref().map(audit_config::tool_snapshot));
+    let result = audit_config::run(&state, &caller, change, async {
+        match crate::ai_tool_registry::delete_tool(&state.db, &id) {
+            Ok(true) => Ok(Applied::new(())),
+            Ok(false) => Err(NOT_FOUND.to_string()),
+            Err(e) => Err(e),
+        }
+    })
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => config_error_response(e, StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -2525,36 +2778,86 @@ async fn handle_get_tool_config(
 async fn handle_save_tool_config(
     State(state): State<Arc<AppState>>,
     Path(tool_id): Path<String>,
-    headers: axum::http::HeaderMap,
+    caller: Caller,
     Json(req): Json<crate::user_tool_config::SaveToolConfigRequest>,
 ) -> impl IntoResponse {
-    let user_id = match extract_user_id(&headers, &state.config.jwt_secret) {
-        Some(uid) => uid,
-        None => return StatusCode::UNAUTHORIZED.into_response(),
-    };
+    let user_id = caller.user_id.clone();
     let user_secret = match state.auth_sessions.read().await.get_user_secret(&user_id) {
         Some(s) => s,
         None => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    match crate::user_tool_config::save_config(&state.db, &user_id, &user_secret, &tool_id, &req) {
+    let existing = crate::user_tool_config::get_config(&state.db, &user_id, &tool_id)
+        .ok()
+        .flatten();
+    let env_keys = audit_config::env_key_names(req.env_values.as_ref());
+    let change = Change::new(
+        ObjectKind::UserToolConfig,
+        if existing.is_some() {
+            Action::Update
+        } else {
+            Action::Create
+        },
+        format!("save own config for tool {}", tool_id),
+    )
+    .before(
+        existing
+            .as_ref()
+            .map(|c| audit_config::user_tool_config_snapshot(c, None)),
+    );
+    let result = audit_config::run(&state, &caller, change, async {
+        let cfg = crate::user_tool_config::save_config(
+            &state.db,
+            &user_id,
+            &user_secret,
+            &tool_id,
+            &req,
+        )?;
+        Ok(Applied::new(cfg.clone())
+            .object_id(cfg.id.clone())
+            .after(Some(audit_config::user_tool_config_snapshot(
+                &cfg, env_keys,
+            ))))
+    })
+    .await;
+    match result {
         Ok(cfg) => Json(cfg).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response(),
+        Err(e) => config_error_response(e, StatusCode::BAD_REQUEST),
     }
 }
 
 async fn handle_delete_tool_config(
     State(state): State<Arc<AppState>>,
     Path(tool_id): Path<String>,
-    AuthUser(user_id): AuthUser,
+    caller: Caller,
 ) -> impl IntoResponse {
-    match crate::user_tool_config::delete_config(&state.db, &user_id, &tool_id) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+    let user_id = caller.user_id.clone();
+    let existing = crate::user_tool_config::get_config(&state.db, &user_id, &tool_id)
+        .ok()
+        .flatten();
+    let mut change = Change::new(
+        ObjectKind::UserToolConfig,
+        Action::Delete,
+        format!("delete own config for tool {}", tool_id),
+    )
+    .before(
+        existing
+            .as_ref()
+            .map(|c| audit_config::user_tool_config_snapshot(c, None)),
+    );
+    if let Some(c) = &existing {
+        change = change.object_id(&c.id);
+    }
+    let result = audit_config::run(&state, &caller, change, async {
+        match crate::user_tool_config::delete_config(&state.db, &user_id, &tool_id) {
+            Ok(true) => Ok(Applied::new(())),
+            Ok(false) => Err(NOT_FOUND.to_string()),
+            Err(e) => Err(e),
+        }
+    })
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => config_error_response(e, StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -2623,21 +2926,58 @@ async fn handle_get_server_tool_config(
 async fn handle_save_server_tool_config(
     State(state): State<Arc<AppState>>,
     Path(tool_id): Path<String>,
-    headers: axum::http::HeaderMap,
+    caller: Caller,
     Json(req): Json<crate::server_tool_config::SaveServerToolConfigRequest>,
 ) -> impl IntoResponse {
-    let user_id = match extract_user_id(&headers, &state.config.jwt_secret) {
-        Some(uid) => uid,
-        None => return StatusCode::UNAUTHORIZED.into_response(),
-    };
+    let user_id = caller.user_id.clone();
     let user_secret = match state.auth_sessions.read().await.get_user_secret(&user_id) {
         Some(s) => s,
         None => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    match crate::server_tool_config::save_config(&state.db, &user_id, &user_secret, &tool_id, &req)
-    {
+    let existing =
+        crate::server_tool_config::get_config(&state.db, &user_id, &req.server_id, &tool_id)
+            .ok()
+            .flatten();
+    let env_keys = audit_config::env_key_names(req.env_overrides.as_ref());
+    let change = Change::new(
+        ObjectKind::ServerToolConfig,
+        if existing.is_some() {
+            Action::Update
+        } else {
+            Action::Create
+        },
+        format!(
+            "save server config for tool {} on server {}",
+            tool_id, req.server_id
+        ),
+    )
+    .target(audit_events::Target {
+        server_id: Some(req.server_id.clone()),
+        ..Default::default()
+    })
+    .before(
+        existing
+            .as_ref()
+            .map(|c| audit_config::server_tool_config_snapshot(c, None)),
+    );
+    let result = audit_config::run(&state, &caller, change, async {
+        let cfg = crate::server_tool_config::save_config(
+            &state.db,
+            &user_id,
+            &user_secret,
+            &tool_id,
+            &req,
+        )?;
+        Ok(Applied::new(cfg.clone())
+            .object_id(cfg.id.clone())
+            .after(Some(audit_config::server_tool_config_snapshot(
+                &cfg, env_keys,
+            ))))
+    })
+    .await;
+    match result {
         Ok(cfg) => Json(cfg).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response(),
+        Err(e) => config_error_response(e, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -2645,17 +2985,49 @@ async fn handle_delete_server_tool_config(
     State(state): State<Arc<AppState>>,
     Path(tool_id): Path<String>,
     Query(query): Query<ServerConfigQuery>,
-    AuthUser(user_id): AuthUser,
+    caller: Caller,
 ) -> impl IntoResponse {
-    match crate::server_tool_config::delete_config(&state.db, &user_id, &query.server_id, &tool_id)
-    {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+    let user_id = caller.user_id.clone();
+    let existing =
+        crate::server_tool_config::get_config(&state.db, &user_id, &query.server_id, &tool_id)
+            .ok()
+            .flatten();
+    let mut change = Change::new(
+        ObjectKind::ServerToolConfig,
+        Action::Delete,
+        format!(
+            "delete server config for tool {} on server {}",
+            tool_id, query.server_id
+        ),
+    )
+    .target(audit_events::Target {
+        server_id: Some(query.server_id.clone()),
+        ..Default::default()
+    })
+    .before(
+        existing
+            .as_ref()
+            .map(|c| audit_config::server_tool_config_snapshot(c, None)),
+    );
+    if let Some(c) = &existing {
+        change = change.object_id(&c.id);
+    }
+    let result = audit_config::run(&state, &caller, change, async {
+        match crate::server_tool_config::delete_config(
+            &state.db,
+            &user_id,
+            &query.server_id,
+            &tool_id,
+        ) {
+            Ok(true) => Ok(Applied::new(())),
+            Ok(false) => Err(NOT_FOUND.to_string()),
+            Err(e) => Err(e),
+        }
+    })
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => config_error_response(e, StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 

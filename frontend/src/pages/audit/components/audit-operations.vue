@@ -1,10 +1,14 @@
 <script setup lang="ts">
   import type { DataTableColumns } from 'naive-ui'
-  import type { OperationRecord } from '@/utils/audit'
+  import type { AuditEvent, ConfigChangePayload, OperationRecord } from '@/utils/audit'
   import {
     NButton,
     NDataTable,
     NDatePicker,
+    NDescriptions,
+    NDescriptionsItem,
+    NDrawer,
+    NDrawerContent,
     NEmpty,
     NInput,
     NPagination,
@@ -18,9 +22,10 @@
   import { useRouter } from 'vue-router'
   import { useApi } from '@/composables/useApi'
   import { useAuthStore } from '@/stores/auth'
-  import { actorKindLabel, evidenceLabel, exitLabel, sourceLabel, statusInfo } from '@/utils/audit'
+  import { actorKindLabel, evidenceLabel, exitLabel, kindLabel, sourceLabel, statusInfo } from '@/utils/audit'
   import { downloadWithAuth } from '@/utils/download'
   import { formatTime } from '@/utils/format'
+  import ConfigChangeDetail from './config-change-detail.vue'
 
   const api = useApi()
   const auth = useAuthStore()
@@ -35,11 +40,13 @@
 
   const search = ref('')
   const filterStatus = ref<string | null>(null)
+  const filterKind = ref<string | null>(null)
   const filterActor = ref<string | null>(null)
   const filterTimeRange = ref<[number, number] | null>(null)
 
   const statusOptions = Object.entries(statusInfo).map(([value, info]) => ({ label: info.label, value }))
   const actorOptions = Object.entries(actorKindLabel).map(([value, label]) => ({ label, value }))
+  const kindOptions = Object.entries(kindLabel).map(([value, label]) => ({ label, value }))
 
   function buildParams(paged: boolean): URLSearchParams {
     const params = new URLSearchParams()
@@ -49,6 +56,7 @@
     }
     if (search.value.trim()) params.set('q', search.value.trim())
     if (filterStatus.value) params.set('status', filterStatus.value)
+    if (filterKind.value) params.set('kind', filterKind.value)
     if (filterActor.value) params.set('actorKind', filterActor.value)
     if (filterTimeRange.value) {
       params.set('timeFrom', new Date(filterTimeRange.value[0]).toISOString())
@@ -81,7 +89,7 @@
 
   onMounted(load)
   watch([page, pageSize], load)
-  watch([filterStatus, filterActor, filterTimeRange], () => {
+  watch([filterStatus, filterKind, filterActor, filterTimeRange], () => {
     page.value = 1
     load()
   })
@@ -112,6 +120,28 @@
     }
   }
 
+  // --- Detail drawer ---
+  interface OperationDetail {
+    operation: OperationRecord
+    events: AuditEvent[]
+    recording: { recordingId: string; offsetMs: number } | null
+  }
+  const detailOpen = ref(false)
+  const detail = ref<OperationDetail | null>(null)
+
+  async function openDetail(row: OperationRecord) {
+    try {
+      detail.value = await api.get<OperationDetail>(`/audit/operations/${row.operationId}`)
+      detailOpen.value = true
+    } catch (e) {
+      message.error((e as Error).message)
+    }
+  }
+
+  function configChange(ev: AuditEvent): ConfigChangePayload | null {
+    return ev.eventType === 'config.change' ? (ev.payload as unknown as ConfigChangePayload) : null
+  }
+
   const columns = computed<DataTableColumns<OperationRecord>>(() => {
     const cols: DataTableColumns<OperationRecord> = [
       { title: '时间', key: 'startedAt', width: 165, render: (r) => formatTime(r.startedAt) }
@@ -132,7 +162,7 @@
         }
       },
       { title: '来源', key: 'source', width: 70, render: (r) => sourceLabel[r.source] || r.source },
-      { title: '类型', key: 'kind', width: 90 },
+      { title: '类型', key: 'kind', width: 90, render: (r) => kindLabel[r.kind] || r.kind },
       { title: '命令 / 操作', key: 'summary', ellipsis: { tooltip: true }, className: 'font-mono text-xs' },
       {
         title: '目标',
@@ -163,13 +193,16 @@
       {
         title: '',
         key: 'actions',
-        width: 80,
+        width: 140,
         render: (r) =>
-          h(
-            NButton,
-            { size: 'tiny', quaternary: true, disabled: !r.sessionId, onClick: () => locate(r) },
-            { default: () => '定位录像' }
-          )
+          h(NSpace, { size: 4, wrap: false }, () => [
+            h(NButton, { size: 'tiny', quaternary: true, onClick: () => openDetail(r) }, { default: () => '详情' }),
+            h(
+              NButton,
+              { size: 'tiny', quaternary: true, disabled: !r.sessionId, onClick: () => locate(r) },
+              { default: () => '定位录像' }
+            )
+          ])
       }
     )
     return cols
@@ -190,6 +223,14 @@
           class="w-28"
         />
         <n-select
+          v-model:value="filterKind"
+          :options="kindOptions"
+          placeholder="类型"
+          clearable
+          size="small"
+          class="w-32"
+        />
+        <n-select
           v-model:value="filterActor"
           :options="actorOptions"
           placeholder="操作者"
@@ -205,7 +246,8 @@
       </n-space>
     </div>
     <p class="mb-2 text-xs opacity-60">
-      仅包含经平台执行通道登记的操作（内置 Agent、受管命令）；人工终端键入不在此列，请查看会话录像。
+      包含经平台执行通道登记的操作（内置 Agent、受管命令、文件与 Git
+      操作）以及用户、服务器、密钥、工具与配置的变更；人工终端键入不在此列，请查看会话录像。
     </p>
 
     <div v-if="!loading && items.length === 0" class="flex flex-1 items-center justify-center">
@@ -232,5 +274,53 @@
         />
       </n-space>
     </template>
+
+    <n-drawer v-model:show="detailOpen" :width="680" placement="right">
+      <n-drawer-content v-if="detail" title="操作详情" closable>
+        <n-descriptions :column="2" size="small" label-placement="left" bordered>
+          <n-descriptions-item label="时间">{{ formatTime(detail.operation.startedAt) }}</n-descriptions-item>
+          <n-descriptions-item label="结束">{{ formatTime(detail.operation.finishedAt) }}</n-descriptions-item>
+          <n-descriptions-item label="操作者">
+            {{ detail.operation.actor.username || detail.operation.actor.user_id || '-' }}
+            <span class="opacity-60">({{ actorKindLabel[detail.operation.actor.kind || ''] || '-' }})</span>
+          </n-descriptions-item>
+          <n-descriptions-item label="类型">
+            {{ kindLabel[detail.operation.kind] || detail.operation.kind }}
+          </n-descriptions-item>
+          <n-descriptions-item label="状态">
+            <n-tag size="small" :type="statusInfo[detail.operation.status]?.type || 'default'">
+              {{ statusInfo[detail.operation.status]?.label || detail.operation.status }}
+            </n-tag>
+          </n-descriptions-item>
+          <n-descriptions-item label="结果依据">
+            {{ evidenceLabel[detail.operation.evidence] || detail.operation.evidence }}
+          </n-descriptions-item>
+          <n-descriptions-item label="摘要" :span="2">
+            <span class="break-all text-xs font-mono">{{ detail.operation.summary }}</span>
+          </n-descriptions-item>
+          <n-descriptions-item v-if="detail.operation.exit" label="退出码" :span="2">
+            {{ exitLabel(detail.operation.exit) }}
+          </n-descriptions-item>
+        </n-descriptions>
+
+        <template v-for="ev in detail.events" :key="ev.eventId">
+          <template v-if="configChange(ev)">
+            <h3 class="mb-2 mt-4 text-sm font-bold">配置变更内容</h3>
+            <config-change-detail :payload="configChange(ev)!" />
+          </template>
+        </template>
+
+        <template v-if="detail.events.some((e) => !configChange(e))">
+          <h3 class="mb-2 mt-4 text-sm font-bold"
+            >事件（{{ detail.events.filter((e) => !configChange(e)).length }}）</h3
+          >
+          <div v-for="ev in detail.events.filter((e) => !configChange(e))" :key="ev.eventId" class="mb-1 text-xs">
+            <span class="opacity-60">{{ formatTime(ev.occurredAt) }}</span>
+            <span class="ml-2 font-mono">{{ ev.eventType }}</span>
+          </div>
+        </template>
+        <n-empty v-if="detail.events.length === 0" description="该操作没有附加事件" size="small" class="mt-4" />
+      </n-drawer-content>
+    </n-drawer>
   </div>
 </template>

@@ -17,8 +17,8 @@ use axum::{
 use serde::Deserialize;
 
 use crate::audit_events::{
-    self, ActorKind, AuditSession, Integrity, NewEvent, OperationFilter, OperationRecord,
-    OperationStatus, SessionFilter, Source,
+    self, ActorKind, AuditSession, Integrity, NewEvent, OperationFilter, OperationKind,
+    OperationRecord, OperationStatus, SessionFilter, Source,
 };
 use crate::extractors::Caller;
 use crate::recording::{ChunkMeta, ChunkProblem, RecordingMeta};
@@ -188,6 +188,7 @@ pub struct OperationQuery {
     /// Substring of the (redacted) command / summary.
     pub q: Option<String>,
     pub status: Option<String>,
+    pub kind: Option<String>,
     pub actor_kind: Option<String>,
     pub session: Option<String>,
     pub server: Option<String>,
@@ -206,6 +207,7 @@ impl OperationQuery {
             task_id: self.task.clone(),
             actor_kind: parse_enum::<ActorKind>(&self.actor_kind)?,
             status: parse_enum::<OperationStatus>(&self.status)?,
+            kind: parse_enum::<OperationKind>(&self.kind)?,
             server_id: self.server.clone(),
             time_from: self.time_from.clone(),
             time_to: self.time_to.clone(),
@@ -628,7 +630,7 @@ pub async fn export(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit_events::{Actor, OperationIntent, OperationKind, Target};
+    use crate::audit_events::{Actor, OperationIntent, Target};
 
     async fn test_state() -> Arc<AppState> {
         let dir = std::env::temp_dir().join(format!("ngterm-audapi-{}", uuid::Uuid::new_v4()));

@@ -264,6 +264,7 @@ pub struct OperationFilter {
     pub time_from: Option<String>,
     pub time_to: Option<String>,
     pub summary_contains: Option<String>,
+    pub kind: Option<OperationKind>,
 }
 
 /// Filter for session listings. `user_id` is mandatory for non-admins and
@@ -737,6 +738,9 @@ pub fn list_operations(
     if let Some(v) = &filter.status {
         add("status = ?", Box::new(enum_str(v)));
     }
+    if let Some(v) = &filter.kind {
+        add("kind = ?", Box::new(enum_str(v)));
+    }
     if let Some(v) = &filter.server_id {
         add("server_id = ?", Box::new(v.clone()));
     }
@@ -839,7 +843,7 @@ pub fn append_event(db: &Database, ev: NewEvent<'_>) -> Result<AuditEvent, Strin
     })
 }
 
-fn redact_json(v: serde_json::Value) -> serde_json::Value {
+pub(crate) fn redact_json(v: serde_json::Value) -> serde_json::Value {
     match v {
         serde_json::Value::String(s) => serde_json::Value::String(redact(&s)),
         serde_json::Value::Array(a) => {
@@ -849,12 +853,14 @@ fn redact_json(v: serde_json::Value) -> serde_json::Value {
             o.into_iter()
                 .map(|(k, v)| {
                     let lk = k.to_ascii_lowercase();
-                    if lk.contains("password")
+                    let sensitive_key = lk.contains("password")
                         || lk.contains("secret")
                         || lk.contains("token")
                         || lk.contains("api_key")
-                        || lk.contains("apikey")
-                    {
+                        || lk.contains("apikey");
+                    // Booleans under such keys are flags ("secret": true), not
+                    // secrets; masking them would destroy the information.
+                    if sensitive_key && !v.is_boolean() {
                         (k, serde_json::Value::String("[REDACTED]".into()))
                     } else {
                         (k, redact_json(v))

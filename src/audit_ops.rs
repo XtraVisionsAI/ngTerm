@@ -121,7 +121,13 @@ pub fn begin(
         target,
         cwd,
     };
-    let operation_id = audit_events::operation_intended(&state.db, &intent).map_err(|e| {
+    begin_intent(state, &intent)
+}
+
+/// Register and start an arbitrary intent. Fails when the record cannot be
+/// persisted; callers must not execute in that case.
+pub fn begin_intent(state: &AppState, intent: &OperationIntent) -> Result<ManagedOp, String> {
+    let operation_id = audit_events::operation_intended(&state.db, intent).map_err(|e| {
         format!(
             "audit record could not be written; operation not executed: {}",
             e

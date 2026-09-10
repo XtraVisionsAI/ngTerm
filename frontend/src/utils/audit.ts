@@ -80,7 +80,66 @@ export interface RecordedEvent {
   r?: number
 }
 
+/** One event of an operation, as returned by /audit/operations/{id}. */
+export interface AuditEvent {
+  eventId: string
+  streamId: string
+  seq: number
+  occurredAt: string
+  recordedAt: string
+  sessionId: string | null
+  operationId: string | null
+  eventType: string
+  payload: Record<string, unknown>
+  integrity: Integrity
+}
+
+/** Payload of a `config.change` event (redacted snapshots, never secrets). */
+export interface ConfigChangePayload {
+  object: string
+  objectId: string | null
+  action: string
+  outcome: 'succeeded' | 'failed'
+  error: string | null
+  before: Record<string, unknown> | null
+  after: Record<string, unknown> | null
+  changedFields: string[]
+}
+
 export type TagType = 'default' | 'success' | 'warning' | 'error' | 'info'
+
+export const kindLabel: Record<string, string> = {
+  command: '命令',
+  file_read: '读文件',
+  file_write: '写文件',
+  file_delete: '删除文件',
+  file_rename: '重命名',
+  mkdir: '建目录',
+  upload: '上传',
+  download: '下载',
+  git: 'Git',
+  tool_call: '工具调用',
+  mcp_call: 'MCP 调用',
+  approval: '审批',
+  config_change: '配置变更'
+}
+
+export const objectKindLabel: Record<string, string> = {
+  user: '用户',
+  server: '服务器',
+  ssh_key: 'SSH 密钥',
+  ai_tool: 'AI 工具',
+  user_tool_config: '用户工具配置',
+  server_tool_config: '服务器工具配置'
+}
+
+export const actionLabel: Record<string, string> = {
+  create: '创建',
+  update: '修改',
+  delete: '删除',
+  password_change: '修改密码',
+  password_reset: '重置密码'
+}
 
 export const actorKindLabel: Record<string, string> = {
   human: '人工',
