@@ -7,6 +7,7 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
+use tracing::Instrument;
 
 use crate::agent_bridge::AgentEvent;
 use crate::auth;
@@ -57,7 +58,10 @@ pub async fn ws_terminal(
 
     ws.max_message_size(limits::MAX_WS_MESSAGE_BYTES)
         .max_frame_size(limits::MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_ws(socket, session_id, state))
+        .on_upgrade(move |socket| {
+            let span = tracing::info_span!("ws_terminal", session = %session_id, user = %user_id);
+            handle_ws(socket, session_id, state).instrument(span)
+        })
 }
 
 /// Keeps the session's attached-client count balanced on every exit path,
@@ -278,7 +282,10 @@ pub async fn ws_agent(
 
     ws.max_message_size(limits::MAX_WS_MESSAGE_BYTES)
         .max_frame_size(limits::MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_agent_ws(socket, agent_id, user_id, state))
+        .on_upgrade(move |socket| {
+            let span = tracing::info_span!("ws_agent", agent = %agent_id, user = %user_id);
+            handle_agent_ws(socket, agent_id, user_id, state).instrument(span)
+        })
 }
 
 async fn handle_agent_ws(

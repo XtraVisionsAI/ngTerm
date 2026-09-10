@@ -901,6 +901,7 @@ impl Recorder {
         };
         if self.tx.try_send(Msg::Event(ev)).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
+            crate::metrics::recording_event_dropped();
         }
     }
 

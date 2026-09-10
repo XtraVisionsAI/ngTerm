@@ -136,7 +136,7 @@ Options:
 
 Audit and recording behaviour is configured through environment variables
 (`NGTERM_RECORDING`, `NGTERM_RECORDING_INPUT`, `NGTERM_RECORDING_MAX_MB`,
-`NGTERM_RECORDING_RETENTION_DAYS`, `NGTERM_AUDIT_RETENTION_DAYS`); see
+`NGTERM_RECORDING_RETENTION_DAYS`, `NGTERM_AUDIT_RETENTION_DAYS`, `NGTERM_DISK_LOW_MB`); see
 [docs/audit.md](docs/audit.md) for what is recorded, who can read it, the
 integrity checks and their limits, and the backup/restore procedure.
 

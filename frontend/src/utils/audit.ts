@@ -227,3 +227,25 @@ export function formatBytes(n: number): string {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`
   return `${(n / 1024 / 1024).toFixed(1)} MiB`
 }
+
+export interface RuntimeMetrics {
+  takenAt: string
+  auditWriteFailures: number
+  lastAuditWriteError: { at: string; error: string } | null
+  recording: { enabled: boolean; eventsDropped: number; queueCapacity: number }
+  disk: { path: string; freeBytes: number; totalBytes: number; lowThresholdBytes: number; low: boolean } | null
+  operations: { running: number; stale: number; staleAfterSecs: number }
+  activeSessions: number
+  activeAgents: number
+  warnings: string[]
+}
+
+export const warningLabel: Record<string, string> = {
+  audit_write_failures: '审计记录写入失败',
+  recording_drops: '录像事件被丢弃',
+  low_disk: '数据目录磁盘不足',
+  disk_unknown: '无法获取磁盘余量',
+  stale_operations: '存在长时间未结束的操作',
+  unclean_previous_shutdown: '上一进程异常退出',
+  recording_disabled: '终端录制已关闭'
+}

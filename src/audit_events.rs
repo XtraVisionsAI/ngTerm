@@ -293,6 +293,28 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
+/// Count a failed write so it is visible in `/api/admin/metrics`; the
+/// caller still decides what the failure means for its own action.
+fn metered<T>(r: Result<T, String>) -> Result<T, String> {
+    if let Err(e) = &r {
+        crate::metrics::audit_write_failed(e);
+    }
+    r
+}
+
+/// Operations currently `running`, and how many of them started before
+/// `stale_before` (RFC 3339) without any end being observed.
+pub fn count_running_operations(db: &Database, stale_before: &str) -> Result<(u32, u32), String> {
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN started_at < ?1 THEN 1 ELSE 0 END), 0)
+             FROM audit_operations WHERE status IN ('intended','running')",
+            params![stale_before],
+            |r| Ok((r.get::<_, u32>(0)?, r.get::<_, u32>(1)?)),
+        )
+        .map_err(|e| e.to_string())
+}
+
 fn to_json<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "null".into())
 }
@@ -416,6 +438,10 @@ pub fn migration_v2_audit_events(conn: &Connection) -> Result<(), rusqlite::Erro
 // ---------------------------------------------------------------------------
 
 pub fn session_started(db: &Database, session: &AuditSession) -> Result<(), String> {
+    metered(session_started_unmetered(db, session))
+}
+
+fn session_started_unmetered(db: &Database, session: &AuditSession) -> Result<(), String> {
     let (integ, detail) = session.integrity.as_db();
     db.conn()
         .execute(
@@ -446,6 +472,15 @@ pub fn session_started(db: &Database, session: &AuditSession) -> Result<(), Stri
 /// reported an end as `interrupted`, with the reason recorded, so nothing
 /// stays "running" forever.
 pub fn session_ended(
+    db: &Database,
+    session_id: &str,
+    reason: &str,
+    integrity: Integrity,
+) -> Result<(), String> {
+    metered(session_ended_unmetered(db, session_id, reason, integrity))
+}
+
+fn session_ended_unmetered(
     db: &Database,
     session_id: &str,
     reason: &str,
@@ -598,6 +633,10 @@ pub fn list_sessions(
 /// Register an operation *before* it executes. Returns the operation id the
 /// caller must use to report the outcome.
 pub fn operation_intended(db: &Database, intent: &OperationIntent) -> Result<String, String> {
+    metered(operation_intended_unmetered(db, intent))
+}
+
+fn operation_intended_unmetered(db: &Database, intent: &OperationIntent) -> Result<String, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let summary = redact(&intent.summary);
     db.conn()
@@ -626,6 +665,10 @@ pub fn operation_intended(db: &Database, intent: &OperationIntent) -> Result<Str
 }
 
 pub fn operation_started(db: &Database, operation_id: &str) -> Result<(), String> {
+    metered(operation_started_unmetered(db, operation_id))
+}
+
+fn operation_started_unmetered(db: &Database, operation_id: &str) -> Result<(), String> {
     db.conn()
         .execute(
             "UPDATE audit_operations SET status = 'running' WHERE operation_id = ?1 AND status = 'intended'",
@@ -638,6 +681,14 @@ pub fn operation_started(db: &Database, operation_id: &str) -> Result<(), String
 /// Record the outcome. A non-terminal status is rejected; an outcome must
 /// say how it knows what it knows.
 pub fn operation_finished(
+    db: &Database,
+    operation_id: &str,
+    outcome: &OperationOutcome,
+) -> Result<(), String> {
+    metered(operation_finished_unmetered(db, operation_id, outcome))
+}
+
+fn operation_finished_unmetered(
     db: &Database,
     operation_id: &str,
     outcome: &OperationOutcome,
@@ -799,6 +850,10 @@ pub fn list_operations(
 /// Append an event to a stream. The sequence number is assigned inside a
 /// transaction so concurrent producers on the same stream never collide.
 pub fn append_event(db: &Database, ev: NewEvent<'_>) -> Result<AuditEvent, String> {
+    metered(append_event_unmetered(db, ev))
+}
+
+fn append_event_unmetered(db: &Database, ev: NewEvent<'_>) -> Result<AuditEvent, String> {
     let mut conn = db.conn();
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let seq: i64 = tx

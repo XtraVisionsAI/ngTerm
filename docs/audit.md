@@ -83,6 +83,7 @@ rows and flag truncation both in the body and with an
 | `NGTERM_RECORDING_INPUT` | `metadata` | `none`, `metadata` (time + length), or `content`. |
 | `NGTERM_RECORDING_MAX_MB` | unlimited | Total size cap for recording files; oldest finished recordings are removed first, then the live recording is truncated if still over. |
 | `NGTERM_RECORDING_RETENTION_DAYS` | forever | Recordings whose session ended before the cutoff are removed hourly (files first, then index rows). |
+| `NGTERM_DISK_LOW_MB` | 512 | Free space in the data directory below which `/api/health` reports `low_disk` and `/api/admin/metrics` marks the disk as low. |
 | `NGTERM_AUDIT_RETENTION_DAYS` | forever | Finished sessions, finished operations, their events and legacy logs older than the cutoff are removed hourly. Live sessions, running operations and `system` events are never removed. Each purge is recorded as `system.retention`. |
 
 Recording files live under `<data-dir>/recordings/<recording-id>/` with
@@ -162,8 +163,23 @@ Rehearse this before relying on it.
 | `GET /api/audit/export?type=sessions\|operations&format=json\|csv` | Bounded export with the same filters as the lists. |
 | `GET /api/audit/system` | Start/shutdown/retention events (admin). |
 | `GET /api/audit/integrity` | Integrity report (admin, recorded). |
+| `GET /api/health` | Unauthenticated liveness: database check, live counts, recovery summary and `warnings` codes (`audit_write_failures`, `recording_drops`, `low_disk`, `disk_unknown`, `stale_operations`, `unclean_previous_shutdown`, `recording_disabled`). 503 only when the database is unusable. |
+| `GET /api/admin/metrics` | The numbers behind the warnings (admin): failed audit writes since start with the last error, recording events dropped, disk free/total, running and stale operations, active sessions and agents. |
+
+## Operational visibility
+
+Every HTTP request carries an `x-request-id` (kept when the client sends
+one, otherwise generated), echoed in the response and present as the `id`
+field of the request span on every log line the request produces. Terminal
+and agent WebSocket tasks log under spans carrying the session or agent id,
+and the embedded engine's tasks under the agent id. Spans record method and
+path only; query strings and headers never reach the log. Audit records that
+could not be written are counted in `/api/admin/metrics` (and the action that
+needed them is refused, see "Truthfulness"), recording events dropped under
+load are counted process-wide as well as marked as gaps in the recording, and
+operations still `running` after 15 minutes are reported as stale so a
+handler that died without reporting is visible. Counters reset on restart;
+the audit store is the durable record.
 
 ## Planned, not yet implemented
 
-- Structured request/session/task/operation identifiers in server logs and
-  queue metrics.

@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 #[cfg(debug_assertions)]
 use tower_http::cors::CorsLayer;
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::audit;
@@ -24,6 +25,7 @@ use crate::config::limits;
 use crate::crypto;
 use crate::extractors::{AdminUser, AuthUser, Caller};
 use crate::key_manager::{self, CreateKeyRequest};
+use crate::metrics;
 use crate::server_registry::{self, CreateServerRequest};
 use crate::ssh_bridge;
 use crate::ws_handler;
@@ -164,6 +166,7 @@ pub fn build_router_with_hooks(state: Arc<AppState>, hooks: RouterHooks) -> Rout
             get(audit_api::recording_events),
         )
         .route("/audit/export", get(audit_api::export))
+        .route("/admin/metrics", get(handle_metrics))
         .route("/audit/system", get(audit_api::list_system_events))
         .route("/audit/integrity", get(audit_api::integrity))
         // UI State
@@ -176,7 +179,14 @@ pub fn build_router_with_hooks(state: Arc<AppState>, hooks: RouterHooks) -> Rout
         .route("/ws/agent/{agent_id}", get(ws_handler::ws_agent))
         .fallback(static_handler)
         .layer(DefaultBodyLimit::max(limits::MAX_JSON_BODY_BYTES))
-        .layer(TraceLayer::new_for_http())
+        // Every request gets an id (client-supplied `x-request-id` is kept,
+        // otherwise a UUID is minted), the id is echoed in the response and
+        // is the span field every log line of the request carries. The span
+        // records method and path only: query strings and headers can hold
+        // tokens and never reach the log.
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
+        .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .with_state(state);
 
     #[cfg(debug_assertions)]
@@ -185,9 +195,25 @@ pub fn build_router_with_hooks(state: Arc<AppState>, hooks: RouterHooks) -> Rout
     router
 }
 
-/// Unauthenticated health check. Reports whether the database answers and
-/// how much is live; returns 503 when the database is unusable so an
-/// orchestrator stops routing traffic here.
+fn request_span(req: &axum::http::Request<axum::body::Body>) -> tracing::Span {
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    tracing::info_span!(
+        "request",
+        id = %request_id,
+        method = %req.method(),
+        path = %req.uri().path(),
+    )
+}
+
+/// Unauthenticated health check. Reports whether the database answers, how
+/// much is live and which operator warnings are raised (codes only; the
+/// numbers behind them are admin-only in `/api/admin/metrics`). Returns 503
+/// when the database is unusable so an orchestrator stops routing traffic
+/// here; warnings alone keep 200 with `status: "degraded"`.
 async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let db_ok = state
         .db
@@ -195,8 +221,10 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         .query_row("SELECT 1", [], |r| r.get::<_, i64>(0))
         .map(|v| v == 1)
         .unwrap_or(false);
+    let warnings = metrics::snapshot(&state).await.warnings;
     let body = serde_json::json!({
-        "status": if db_ok { "ok" } else { "degraded" },
+        "status": if !db_ok || !warnings.is_empty() { "degraded" } else { "ok" },
+        "warnings": warnings,
         "db": if db_ok { "ok" } else { "error" },
         "activeSessions": state.sessions.list_all_session_count(),
         "activeAgents": state.agents.active_count().await,
@@ -217,6 +245,15 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         StatusCode::SERVICE_UNAVAILABLE
     };
     (code, Json(body))
+}
+
+/// Full operational snapshot for administrators: counters, disk headroom,
+/// running/stale operations and the warnings derived from them.
+async fn handle_metrics(
+    State(state): State<Arc<AppState>>,
+    _admin: AdminUser,
+) -> impl IntoResponse {
+    Json(metrics::snapshot(&state).await)
 }
 
 async fn static_handler(uri: Uri) -> impl IntoResponse {

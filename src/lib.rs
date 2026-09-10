@@ -15,6 +15,7 @@ pub mod extractors;
 pub mod helper_pool;
 pub mod key_manager;
 pub mod local_pty;
+pub mod metrics;
 pub mod rate_limit;
 pub mod recording;
 pub mod scrollback;
@@ -99,6 +100,23 @@ pub async fn build_app_state(
         retention,
         std::time::Duration::from_secs(3600),
     );
+    match metrics::disk_status(&config.data_dir) {
+        Some(d) if d.low => tracing::warn!(
+            "Low disk space in {}: {} MiB free (threshold {} MiB, NGTERM_DISK_LOW_MB)",
+            d.path,
+            d.free_bytes / 1024 / 1024,
+            d.low_threshold_bytes / 1024 / 1024
+        ),
+        Some(d) => tracing::info!(
+            "Data directory {}: {} MiB free",
+            d.path,
+            d.free_bytes / 1024 / 1024
+        ),
+        None => tracing::warn!(
+            "Free space of {} could not be determined; low-disk warnings unavailable",
+            config.data_dir
+        ),
+    }
     let (session_manager, session_ended_rx) =
         session_manager::SessionManager::new(recordings.clone());
 
