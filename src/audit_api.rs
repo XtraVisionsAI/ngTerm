@@ -193,6 +193,8 @@ pub struct OperationQuery {
     pub session: Option<String>,
     pub server: Option<String>,
     pub task: Option<String>,
+    /// Only the lower-level operations caused by this operation.
+    pub parent: Option<String>,
     pub time_from: Option<String>,
     pub time_to: Option<String>,
     pub limit: Option<u32>,
@@ -212,6 +214,7 @@ impl OperationQuery {
             time_from: self.time_from.clone(),
             time_to: self.time_to.clone(),
             summary_contains: self.q.clone().filter(|s| !s.trim().is_empty()),
+            parent_operation_id: self.parent.clone(),
         })
     }
 }
@@ -284,10 +287,27 @@ pub async fn get_operation(
         Ok(r) => r,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
+    // Lower-level operations this one caused (e.g. the shell commands behind
+    // a file tool call), so a reader sees one high-level action with its
+    // mechanics attached instead of counting them twice.
+    let children = match audit_events::list_operations(
+        &state.db,
+        &OperationFilter {
+            user_id: caller.scope_user_id(),
+            parent_operation_id: Some(operation_id.clone()),
+            ..Default::default()
+        },
+        MAX_PAGE,
+        0,
+    ) {
+        Ok((rows, _)) => rows,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
     Json(serde_json::json!({
         "operation": op,
         "events": events,
         "recording": recording,
+        "children": children,
     }))
     .into_response()
 }

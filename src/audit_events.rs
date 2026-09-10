@@ -83,6 +83,9 @@ pub enum OperationKind {
     McpCall,
     Approval,
     ConfigChange,
+    /// Starting an agent (external CLI or embedded engine) inside a session.
+    /// The summary carries the tool and its capability declaration.
+    AgentLaunch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +268,8 @@ pub struct OperationFilter {
     pub time_to: Option<String>,
     pub summary_contains: Option<String>,
     pub kind: Option<OperationKind>,
+    /// Only operations caused by this one (lower-level calls of a tool call).
+    pub parent_operation_id: Option<String>,
 }
 
 /// Filter for session listings. `user_id` is mandatory for non-admins and
@@ -752,6 +757,9 @@ pub fn list_operations(
     }
     if let Some(v) = &filter.summary_contains {
         add("summary LIKE ?", Box::new(format!("%{}%", v)));
+    }
+    if let Some(v) = &filter.parent_operation_id {
+        add("parent_operation_id = ?", Box::new(v.clone()));
     }
     let where_clause = if conds.is_empty() {
         String::new()

@@ -131,7 +131,8 @@ export const kindLabel: Record<string, string> = {
   tool_call: '工具调用',
   mcp_call: 'MCP 调用',
   approval: '审批',
-  config_change: '配置变更'
+  config_change: '配置变更',
+  agent_launch: 'Agent 启动'
 }
 
 export const objectKindLabel: Record<string, string> = {

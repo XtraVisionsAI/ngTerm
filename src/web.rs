@@ -2356,6 +2356,27 @@ pub async fn start_agent_inner(
 
     let agent_id = format!("agent-{}", session_id);
 
+    // The launch itself is an operation. External CLIs run their own tools
+    // inside the PTY; the platform cannot observe those individually, so the
+    // record states the capability declaration instead of pretending to.
+    let launch = audit_ops::begin(
+        state,
+        session_id,
+        &ctx.user_id,
+        OperationKind::AgentLaunch,
+        agent_launch_summary(&ctx.tool.name, ext.supports_approval, body.require_approval),
+        body.working_dir
+            .as_deref()
+            .filter(|w| !w.trim().is_empty())
+            .map(|w| w.to_string()),
+    );
+    let launch = match launch {
+        Ok(op) => op,
+        Err(e) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError { error: e })).into_response()
+        }
+    };
+
     match state
         .agents
         .start(
@@ -2369,12 +2390,16 @@ pub async fn start_agent_inner(
         )
         .await
     {
-        Ok(()) => Json(serde_json::json!({
-            "agentId": agent_id,
-            "supportsApproval": ext.supports_approval,
-        }))
-        .into_response(),
+        Ok(()) => {
+            launch.succeeded();
+            Json(serde_json::json!({
+                "agentId": agent_id,
+                "supportsApproval": ext.supports_approval,
+            }))
+            .into_response()
+        }
         Err(e) => {
+            launch.failed(&e);
             tracing::error!("Agent start failed [{}]: {}", agent_id, e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2383,6 +2408,24 @@ pub async fn start_agent_inner(
                 .into_response()
         }
     }
+}
+
+/// Summary of an external CLI agent launch: what was started and what the
+/// platform can and cannot see of it.
+pub fn agent_launch_summary(
+    tool_name: &str,
+    supports_approval: bool,
+    require_approval: bool,
+) -> String {
+    let approval = match (supports_approval, require_approval) {
+        (true, true) => "per-operation approval requested from the CLI",
+        (true, false) => "CLI approval prompts relaxed (acceptEdits)",
+        (false, _) => "CLI uses its own permission model; platform cannot enforce approval",
+    };
+    format!(
+        "launch external CLI agent \"{}\" ({}); its internal tool calls are not observed individually, only the terminal recording",
+        tool_name, approval
+    )
 }
 
 async fn handle_start_agent(

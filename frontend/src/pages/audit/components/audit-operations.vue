@@ -125,17 +125,24 @@
     operation: OperationRecord
     events: AuditEvent[]
     recording: { recordingId: string; offsetMs: number } | null
+    /** Lower-level operations caused by this one (the commands behind a tool call). */
+    children: OperationRecord[]
   }
   const detailOpen = ref(false)
   const detail = ref<OperationDetail | null>(null)
 
   async function openDetail(row: OperationRecord) {
     try {
-      detail.value = await api.get<OperationDetail>(`/audit/operations/${row.operationId}`)
+      const d = await api.get<OperationDetail>(`/audit/operations/${row.operationId}`)
+      detail.value = { ...d, children: d.children ?? [] }
       detailOpen.value = true
     } catch (e) {
       message.error((e as Error).message)
     }
+  }
+
+  async function openDetailById(operationId: string) {
+    await openDetail({ operationId } as OperationRecord)
   }
 
   function configChange(ev: AuditEvent): ConfigChangePayload | null {
@@ -301,7 +308,27 @@
           <n-descriptions-item v-if="detail.operation.exit" label="退出码" :span="2">
             {{ exitLabel(detail.operation.exit) }}
           </n-descriptions-item>
+          <n-descriptions-item v-if="detail.operation.parentOperationId" label="所属操作" :span="2">
+            <n-button text size="tiny" type="primary" @click="openDetailById(detail.operation.parentOperationId!)">
+              查看上层操作
+            </n-button>
+            <span class="ml-2 text-xs opacity-60">此记录是上层工具调用的底层调用，统计时不重复计数</span>
+          </n-descriptions-item>
         </n-descriptions>
+
+        <template v-if="detail.children.length > 0">
+          <h3 class="mb-2 mt-4 text-sm font-bold">底层调用（{{ detail.children.length }}）</h3>
+          <div v-for="c in detail.children" :key="c.operationId" class="mb-1 flex items-center gap-2 text-xs">
+            <span class="opacity-60">{{ formatTime(c.startedAt) }}</span>
+            <n-tag size="tiny" :type="statusInfo[c.status]?.type || 'default'">
+              {{ statusInfo[c.status]?.label || c.status }}
+            </n-tag>
+            <span>{{ kindLabel[c.kind] || c.kind }}</span>
+            <n-button text size="tiny" type="primary" @click="openDetail(c)">
+              <span class="break-all font-mono">{{ c.summary }}</span>
+            </n-button>
+          </div>
+        </template>
 
         <template v-for="ev in detail.events" :key="ev.eventId">
           <template v-if="configChange(ev)">

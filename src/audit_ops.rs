@@ -60,6 +60,42 @@ impl ManagedOp {
     }
 }
 
+impl ManagedOp {
+    /// Policy or a person refused the operation; nothing ran.
+    pub fn denied(self, reason: &str) {
+        self.finish(OperationOutcome {
+            status: OperationStatus::Denied,
+            exit: ExitStatus::Unknown {
+                reason: audit_events::redact(reason),
+            },
+            evidence: Evidence::None,
+        })
+    }
+
+    /// The requester stopped it; whether the underlying work stopped on the
+    /// target is stated in `reason`, never assumed.
+    pub fn cancelled(self, reason: &str) {
+        self.finish(OperationOutcome {
+            status: OperationStatus::Cancelled,
+            exit: ExitStatus::Unknown {
+                reason: audit_events::redact(reason),
+            },
+            evidence: Evidence::None,
+        })
+    }
+
+    /// The end was not observed (session gone, process died).
+    pub fn interrupted(self, reason: &str) {
+        self.finish(OperationOutcome {
+            status: OperationStatus::Interrupted,
+            exit: ExitStatus::Unknown {
+                reason: audit_events::redact(reason),
+            },
+            evidence: Evidence::None,
+        })
+    }
+}
+
 impl Drop for ManagedOp {
     fn drop(&mut self) {
         if self.finished {
@@ -186,6 +222,112 @@ pub enum OpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn refusals_and_stops_are_distinct_from_failures_and_children_are_linked() {
+        let state = test_state().await;
+        let parent = begin(
+            &state,
+            "s9",
+            "u1",
+            OperationKind::ToolCall,
+            "read_file /etc/hosts".into(),
+            None,
+        )
+        .unwrap();
+        let parent_id = parent.id().to_string();
+
+        let child_intent = OperationIntent {
+            session_id: Some("s9".into()),
+            task_id: None,
+            parent_operation_id: Some(parent_id.clone()),
+            actor: Actor {
+                kind: Some(ActorKind::EmbeddedAgent),
+                user_id: Some("u1".into()),
+                ..Default::default()
+            },
+            source: Source::Chat,
+            kind: OperationKind::Command,
+            summary: "cat /etc/hosts".into(),
+            target: Target::default(),
+            cwd: None,
+        };
+        begin_intent(&state, &child_intent).unwrap().succeeded();
+        parent.succeeded();
+
+        begin(
+            &state,
+            "s9",
+            "u1",
+            OperationKind::Command,
+            "rm -rf /".into(),
+            None,
+        )
+        .unwrap()
+        .denied("policy: destructive command token=abc123");
+        begin(
+            &state,
+            "s9",
+            "u1",
+            OperationKind::Command,
+            "sleep 99".into(),
+            None,
+        )
+        .unwrap()
+        .cancelled("agent stopped by user; termination not confirmed");
+        begin(
+            &state,
+            "s9",
+            "u1",
+            OperationKind::McpCall,
+            "fs.list".into(),
+            None,
+        )
+        .unwrap()
+        .interrupted("session closed");
+
+        let (children, n) = audit_events::list_operations(
+            &state.db,
+            &audit_events::OperationFilter {
+                parent_operation_id: Some(parent_id.clone()),
+                ..Default::default()
+            },
+            10,
+            0,
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(children[0].summary, "cat /etc/hosts");
+        assert_eq!(
+            children[0].parent_operation_id.as_deref(),
+            Some(parent_id.as_str())
+        );
+
+        let (all, _) = audit_events::list_operations(
+            &state.db,
+            &audit_events::OperationFilter {
+                session_id: Some("s9".into()),
+                ..Default::default()
+            },
+            10,
+            0,
+        )
+        .unwrap();
+        let status_of = |needle: &str| all.iter().find(|o| o.summary.contains(needle)).unwrap();
+        assert_eq!(status_of("rm -rf").status, OperationStatus::Denied);
+        match &status_of("rm -rf").exit {
+            Some(ExitStatus::Unknown { reason }) => {
+                assert!(reason.contains("[REDACTED]"), "{}", reason)
+            }
+            other => panic!("{:?}", other),
+        }
+        assert_eq!(status_of("sleep").status, OperationStatus::Cancelled);
+        assert_eq!(status_of("fs.list").status, OperationStatus::Interrupted);
+        assert!(all
+            .iter()
+            .all(|o| o.evidence != Evidence::ExecutorConfirmed
+                || o.status == OperationStatus::Succeeded));
+    }
 
     async fn test_state() -> std::sync::Arc<AppState> {
         let dir = std::env::temp_dir().join(format!("ngterm-audops-{}", uuid::Uuid::new_v4()));

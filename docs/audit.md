@@ -10,7 +10,7 @@ marked as such.
 | Record | Table | Content |
 |---|---|---|
 | Session | `audit_sessions` | Who connected (platform user, source address), to what (server, remote account), when it started and ended, why it ended, and whether its recording is complete, has gaps, or was truncated. |
-| Operation | `audit_operations` | Something the platform executed on a user's behalf through its own channel: SFTP file read/write/delete/rename/mkdir/upload/download, git queries, native-engine commands, and configuration changes. Each has an intent (written **before** execution), a truthful outcome, an exit status (`known` code or `unknown` with reason) and an evidence level (`executor_confirmed`, `parsed_from_output`, `declared`, `none`). |
+| Operation | `audit_operations` | Something the platform executed on a user's behalf through its own channel: SFTP file read/write/delete/rename/mkdir/upload/download, git queries, agent launches, native-engine tool calls with the commands they caused linked through `parent_operation_id`, and configuration changes. Each has an intent (written **before** execution), a truthful outcome, an exit status (`known` code or `unknown` with reason) and an evidence level (`executor_confirmed`, `parsed_from_output`, `declared`, `none`). |
 | Event | `audit_events` | Append-only, per-stream sequenced records: operation lifecycle, configuration-change snapshots (`config.change`), audit access (`audit.export`, `audit.recording_read`, `audit.integrity_check`), and process events (`system.startup`, `system.shutdown`, `system.retention`). |
 | Recording | `audit_recordings` + `audit_recording_chunks` | Terminal output of every session as gzip-compressed NDJSON chunks with SHA-256 hashes, plus resize events and (by default) input *metadata* only. |
 | Legacy connection log | `audit_logs` | Kept for the historical connection list. |
@@ -21,6 +21,12 @@ marked as such.
   terminal produces a recording, not a list of operations. Shell-level
   command boundaries are not knowable from a PTY stream and NGTerm does
   not pretend otherwise. Use the recording player.
+- **External CLI agents are recorded as a launch, not as tool calls.** A CLI
+  such as Claude Code runs its own tools inside the PTY; the platform cannot
+  see them individually. The `agent_launch` operation states what was
+  started and what approval mode was requested, and the terminal recording
+  holds the rest. Only the embedded engine (enterprise edition) records each
+  tool call with the commands it caused.
 - **Passwords never reach the audit store.** Password changes and resets
   are recorded as events without the password.
 - **SSH private keys** appear only as metadata: name, fingerprint, key type.
@@ -150,7 +156,7 @@ Rehearse this before relying on it.
 | Method and path | Purpose |
 |---|---|
 | `GET /api/audit/sessions`, `/api/audit/sessions/{id}` | Session search and detail (operations, recordings). |
-| `GET /api/audit/operations`, `/api/audit/operations/{id}` | Operation search (`q`, `status`, `kind`, `actorKind`, `session`, `server`, `task`, time range) and detail with events and recording offset. |
+| `GET /api/audit/operations`, `/api/audit/operations/{id}` | Operation search (`q`, `status`, `kind`, `actorKind`, `session`, `server`, `task`, `parent`, time range) and detail with events, recording offset and the lower-level operations it caused (`children`). |
 | `GET /api/audit/sessions/{id}/recordings` | Recording metadata, chunks and verification problems. |
 | `GET /api/audit/recordings/{id}/events` | Playback events (access is recorded). |
 | `GET /api/audit/export?type=sessions\|operations&format=json\|csv` | Bounded export with the same filters as the lists. |
@@ -159,7 +165,5 @@ Rehearse this before relying on it.
 
 ## Planned, not yet implemented
 
-- Recording of external CLI agent launches and capability declarations as
-  operations (the enterprise native engine already records its commands).
 - Structured request/session/task/operation identifiers in server logs and
   queue metrics.
