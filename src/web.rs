@@ -57,6 +57,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
 pub fn build_router_with_hooks(state: Arc<AppState>, hooks: RouterHooks) -> Router {
     let api = Router::new()
+        // Liveness/readiness for load balancers and orchestrators.
+        .route("/health", get(handle_health))
         // Auth
         .route("/auth/login", post(handle_login))
         .route("/auth/admin-login", post(handle_admin_login))
@@ -161,6 +163,31 @@ pub fn build_router_with_hooks(state: Arc<AppState>, hooks: RouterHooks) -> Rout
     let router = router.layer(CorsLayer::permissive());
 
     router
+}
+
+/// Unauthenticated health check. Reports whether the database answers and
+/// how much is live; returns 503 when the database is unusable so an
+/// orchestrator stops routing traffic here.
+async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let db_ok = state
+        .db
+        .conn()
+        .query_row("SELECT 1", [], |r| r.get::<_, i64>(0))
+        .map(|v| v == 1)
+        .unwrap_or(false);
+    let body = serde_json::json!({
+        "status": if db_ok { "ok" } else { "degraded" },
+        "db": if db_ok { "ok" } else { "error" },
+        "activeSessions": state.sessions.list_all_session_count(),
+        "activeAgents": state.agents.active_count().await,
+        "schemaVersion": state.db.schema_version(),
+    });
+    let code = if db_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(body))
 }
 
 async fn static_handler(uri: Uri) -> impl IntoResponse {

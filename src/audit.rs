@@ -28,17 +28,25 @@ pub struct AuditFilter {
     pub time_to: Option<String>,
 }
 
+/// Close audit rows left open by a previous process (crash or hard kill).
 pub fn close_stale_sessions(db: &Database) {
-    let now = Utc::now().to_rfc3339();
-    let result = db.conn().execute(
-        "UPDATE audit_logs SET disconnected_at = ?1, disconnect_reason = 'server_restart' WHERE disconnected_at IS NULL",
-        rusqlite::params![now],
-    );
-    match result {
+    match close_open_sessions(db, "server_restart") {
         Ok(n) if n > 0 => tracing::info!("Closed {} stale audit sessions from previous run", n),
         Err(e) => tracing::error!("Failed to close stale audit sessions: {}", e),
         _ => {}
     }
+}
+
+/// Mark every still-open audit row as disconnected with `reason`. Returns the
+/// number of rows updated.
+pub fn close_open_sessions(db: &Database, reason: &str) -> Result<usize, String> {
+    let now = Utc::now().to_rfc3339();
+    db.conn()
+        .execute(
+            "UPDATE audit_logs SET disconnected_at = ?1, disconnect_reason = ?2 WHERE disconnected_at IS NULL",
+            rusqlite::params![now, reason],
+        )
+        .map_err(|e| e.to_string())
 }
 
 pub fn log_connect(

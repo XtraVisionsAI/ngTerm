@@ -6,6 +6,13 @@ pub struct Database {
     conn: Mutex<Connection>,
 }
 
+type MigrationStep = fn(&Connection) -> Result<(), rusqlite::Error>;
+
+/// Ordered, append-only list of schema migrations. Never edit or remove an
+/// entry once released; add a new version instead.
+const MIGRATIONS: &[(u32, &str, MigrationStep)] =
+    &[(1, "baseline schema", Database::migration_v1_baseline)];
+
 impl Database {
     pub fn open(data_dir: &str) -> Result<Self, rusqlite::Error> {
         let db_path = Path::new(data_dir).join("onemux.db");
@@ -17,8 +24,81 @@ impl Database {
         Ok(db)
     }
 
+    /// Apply every schema migration newer than the recorded version, each in
+    /// its own transaction, then run the idempotent post-migration hooks
+    /// (seeding, option canonicalisation). A migration that fails leaves the
+    /// database at the previous version; nothing is ever dropped.
     fn migrate(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version    INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );",
+        )?;
+        for (version, name, step) in MIGRATIONS {
+            if Self::migration_applied(&conn, *version)? {
+                continue;
+            }
+            Self::apply_migration(&mut conn, *version, name, *step)?;
+        }
+
+        // Post-migration hooks: idempotent, not versioned, never destructive.
+        conn.execute(
+            "INSERT OR IGNORE INTO users (id, username, password, role, kdf_salt, encrypted_secret, secret_nonce, created_at) VALUES ('admin', 'admin', '', 'admin', X'00', X'00', X'00', datetime('now'))",
+            [],
+        ).ok();
+        Self::seed_builtin_tools(&conn);
+        match crate::ai_tool_registry::migrate_tool_options_conn(&conn) {
+            Ok(n) if n > 0 => tracing::info!("Migrated {} AI tool option document(s)", n),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("AI tool options migration failed: {}", e),
+        }
+        Ok(())
+    }
+
+    fn migration_applied(conn: &Connection, version: u32) -> Result<bool, rusqlite::Error> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+            rusqlite::params![version],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+    }
+
+    fn apply_migration(
+        conn: &mut Connection,
+        version: u32,
+        name: &str,
+        step: MigrationStep,
+    ) -> Result<(), rusqlite::Error> {
+        let tx = conn.transaction()?;
+        step(&tx)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![version, chrono::Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        tracing::info!("Applied schema migration {} ({})", version, name);
+        Ok(())
+    }
+
+    /// Highest applied schema version (0 for a database without the table).
+    pub fn schema_version(&self) -> u32 {
+        self.conn()
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u32)
+            .unwrap_or(0)
+    }
+
+    /// Baseline schema. Written with IF NOT EXISTS / add-column-if-missing so
+    /// it can be recorded as applied on databases that predate versioning
+    /// without touching their data.
+    fn migration_v1_baseline(conn: &Connection) -> Result<(), rusqlite::Error> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS users (
@@ -111,27 +191,8 @@ impl Database {
             );
 ",
         )?;
-
-        // Ensure admin placeholder exists for foreign key compatibility
-        conn.execute(
-            "INSERT OR IGNORE INTO users (id, username, password, role, kdf_salt, encrypted_secret, secret_nonce, created_at) VALUES ('admin', 'admin', '', 'admin', X'00', X'00', X'00', datetime('now'))",
-            [],
-        ).ok();
-
-        // Seed built-in AI tools
-        Self::seed_builtin_tools(&conn);
-
-        // Canonicalise stored tool options (legacy camelCase → snake_case).
-        match crate::ai_tool_registry::migrate_tool_options_conn(&conn) {
-            Ok(n) if n > 0 => tracing::info!("Migrated {} AI tool option document(s)", n),
-            Ok(_) => {}
-            Err(e) => tracing::warn!("AI tool options migration failed: {}", e),
-        }
-
-        // Incremental migrations: add columns if missing
-        Self::add_column_if_missing(&conn, "servers", "host_key_fingerprint", "TEXT");
-        Self::add_column_if_missing(&conn, "servers", "idle_timeout_secs", "INTEGER DEFAULT 0");
-
+        Self::add_column_if_missing(conn, "servers", "host_key_fingerprint", "TEXT")?;
+        Self::add_column_if_missing(conn, "servers", "idle_timeout_secs", "INTEGER DEFAULT 0")?;
         Ok(())
     }
 
@@ -216,15 +277,107 @@ impl Database {
         }
     }
 
-    fn add_column_if_missing(conn: &Connection, table: &str, column: &str, col_type: &str) {
+    fn add_column_if_missing(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        col_type: &str,
+    ) -> Result<(), rusqlite::Error> {
         let sql = format!("SELECT {column} FROM {table} LIMIT 0");
         if conn.execute_batch(&sql).is_err() {
             let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {col_type}");
-            conn.execute_batch(&alter).ok();
+            conn.execute_batch(&alter)?;
         }
+        Ok(())
     }
 
     pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ngterm-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn migrations_are_recorded_once_and_reopen_is_a_noop() {
+        let dir = temp_dir();
+        let db = Database::open(dir.to_str().unwrap()).unwrap();
+        assert_eq!(db.schema_version(), MIGRATIONS.last().unwrap().0);
+        db.conn()
+            .execute(
+                "INSERT INTO servers (id, alias, host, username, created_at) VALUES ('s1','a','h','u','now')",
+                [],
+            )
+            .unwrap();
+        drop(db);
+
+        let db = Database::open(dir.to_str().unwrap()).unwrap();
+        assert_eq!(db.schema_version(), MIGRATIONS.last().unwrap().0);
+        let rows: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows as usize, MIGRATIONS.len());
+        let servers: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM servers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(servers, 1, "data survives reopen");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pre_versioning_database_is_adopted_without_data_loss() {
+        let dir = temp_dir();
+        // Simulate a database created before schema_migrations existed: old
+        // servers table without the later columns, with a row in it.
+        {
+            let conn = Connection::open(dir.join("onemux.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE servers (id TEXT PRIMARY KEY, group_name TEXT DEFAULT '', alias TEXT NOT NULL, host TEXT NOT NULL, port INTEGER DEFAULT 22, username TEXT NOT NULL, key_id TEXT, tags TEXT DEFAULT '[]', ai_tool_id TEXT, created_at TEXT NOT NULL);
+                 INSERT INTO servers (id, alias, host, username, created_at) VALUES ('old','a','h','u','now');",
+            )
+            .unwrap();
+        }
+        let db = Database::open(dir.to_str().unwrap()).unwrap();
+        assert_eq!(db.schema_version(), 1);
+        let (alias, idle): (String, i64) = db
+            .conn()
+            .query_row(
+                "SELECT alias, COALESCE(idle_timeout_secs, 0) FROM servers WHERE id = 'old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(alias, "a");
+        assert_eq!(idle, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_migration_is_rolled_back_and_not_recorded() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        fn bad(conn: &Connection) -> Result<(), rusqlite::Error> {
+            conn.execute_batch("CREATE TABLE half_done (x);")?;
+            conn.execute_batch("THIS IS NOT SQL;")
+        }
+        assert!(Database::apply_migration(&mut conn, 7, "bad", bad).is_err());
+        assert!(!Database::migration_applied(&conn, 7).unwrap());
+        assert!(
+            conn.execute_batch("SELECT * FROM half_done").is_err(),
+            "partial work rolled back"
+        );
     }
 }

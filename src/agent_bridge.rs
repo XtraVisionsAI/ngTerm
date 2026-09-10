@@ -416,6 +416,11 @@ impl AgentBridge {
         self.sessions.lock().await.contains_key(agent_id)
     }
 
+    /// Number of live agent sessions (for health reporting).
+    pub async fn active_count(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+
     /// `None` when the agent does not exist; otherwise whether `user_id`
     /// started it.
     pub async fn is_owner(&self, agent_id: &str, user_id: &str) -> Option<bool> {

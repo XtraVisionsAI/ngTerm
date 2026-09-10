@@ -24,7 +24,8 @@ pub enum SessionInput {
 /// connection, audit row) here rather than at each individual exit path.
 pub struct SessionEnded {
     pub session_id: String,
-    /// `ssh_closed`, `user_closed`, `idle_timeout` or `input_closed`.
+    /// `ssh_closed`, `user_closed`, `idle_timeout`, `input_closed` or
+    /// `server_shutdown`.
     pub reason: String,
 }
 
@@ -32,6 +33,7 @@ pub const REASON_SSH_CLOSED: &str = "ssh_closed";
 pub const REASON_USER_CLOSED: &str = "user_closed";
 pub const REASON_IDLE_TIMEOUT: &str = "idle_timeout";
 pub const REASON_INPUT_CLOSED: &str = "input_closed";
+pub const REASON_SERVER_SHUTDOWN: &str = "server_shutdown";
 
 struct Session {
     pub id: String,
@@ -249,6 +251,20 @@ impl SessionManager {
         if let Some(tx) = session.close_tx.take() {
             let _ = tx.send(reason.to_string());
         }
+    }
+
+    /// Request closure of every live session (server shutdown). Returns how
+    /// many were asked to close; each reports `SessionEnded` when done.
+    pub fn close_all(&self, reason: &str) -> usize {
+        let mut sessions = self.sessions.lock().unwrap();
+        let mut n = 0;
+        for s in sessions.values_mut() {
+            if s.close_tx.is_some() {
+                Self::request_close(s, reason);
+                n += 1;
+            }
+        }
+        n
     }
 
     pub fn session_exists(&self, id: &str) -> bool {
