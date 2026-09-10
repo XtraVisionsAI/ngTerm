@@ -1,5 +1,5 @@
 <script setup lang="ts">
-  import type { AgentStatus, PermissionRequest } from '@/composables/useAgentSocket'
+  import type { AgentStatus, PermissionRequest, UserQuestion } from '@/composables/useAgentSocket'
   import { NButton, NCheckbox, NCollapse, NCollapseItem, NDropdown, NInput, NSelect, NSpin, NTag } from 'naive-ui'
   import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
   import ServerToolConfigForm from '@/components/server-tool-config-form.vue'
@@ -59,6 +59,11 @@
 
   const toolTarget = computed(() => selectedTool.value?.options?.execution?.target || 'chat')
   const isNativeTool = computed(() => selectedTool.value?.type === 'native')
+  const externalSupportsApproval = computed(() => {
+    const ext = selectedTool.value?.options?.external || {}
+    return !!(ext.supports_approval ?? ext.supportsApproval)
+  })
+  const canChooseApproval = computed(() => isNativeTool.value || externalSupportsApproval.value)
   const forceApprovalAbove = computed(() => selectedTool.value?.options?.execution?.force_approval_above || 'high')
 
   const targetOptions = computed(() => {
@@ -127,6 +132,7 @@
   const tokenUsage = ref({ input: 0, output: 0 })
   const costUsd = ref(0)
   const pendingApproval = ref<PermissionRequest | null>(null)
+  const pendingQuestion = ref<UserQuestion | null>(null)
 
   onMounted(loadTools)
 
@@ -264,6 +270,15 @@
       pendingApproval.value = v
       if (v) nextTick(scrollToBottom)
     })
+    watch(socket.pendingQuestion, (v) => {
+      pendingQuestion.value = v
+      if (v) nextTick(scrollToBottom)
+    })
+  }
+
+  function answerQuestion(answer: string) {
+    socket?.answerQuestion(answer)
+    nextTick(scrollToBottom)
   }
 
   function sendMessage() {
@@ -289,6 +304,7 @@
     status.value = 'idle'
     messages.value = []
     pendingApproval.value = null
+    pendingQuestion.value = null
   }
 
   function scrollToBottom() {
@@ -305,6 +321,8 @@
         return '执行工具...'
       case 'waiting_approval':
         return '等待审批'
+      case 'waiting_input':
+        return '等待回答'
       case 'idle':
         return '就绪'
       case 'disconnected':
@@ -321,6 +339,8 @@
       case 'tool_use':
         return 'warning'
       case 'waiting_approval':
+        return 'info'
+      case 'waiting_input':
         return 'info'
       case 'idle':
         return 'success'
@@ -489,10 +509,14 @@
                 style="width: 80px"
                 :disabled="targetOptions.length <= 1"
               />
-              <template v-if="isNativeTool">
+              <template v-if="canChooseApproval">
                 <span class="text-om-dimmed">|</span>
                 <span class="text-om-dimmed">审批等级:</span>
                 <n-select v-model:value="approvalLevel" :options="approvalOptions" size="tiny" style="width: 110px" />
+              </template>
+              <template v-else>
+                <span class="text-om-dimmed">|</span>
+                <span class="text-om-dimmed">该工具不支持审批，命令将直接执行</span>
               </template>
             </div>
             <div v-if="currentServerId" class="flex items-center gap-3">
@@ -626,6 +650,21 @@
           >
             <n-spin size="tiny" />
             <span>{{ statusLabel(status) }}</span>
+          </div>
+
+          <!-- ask_user question -->
+          <div v-if="pendingQuestion" class="mt-2 border border-om-border rounded bg-om-panel p-3">
+            <div class="mb-2 flex items-center gap-2 text-xs text-om-primary">
+              <i class="i-ri:question-line" style="display: inline-block; width: 14px; height: 14px" />
+              <span class="font-bold">代理提问</span>
+            </div>
+            <div class="mb-2 whitespace-pre-wrap text-xs text-om-text">{{ pendingQuestion.question }}</div>
+            <div v-if="pendingQuestion.options.length > 0" class="flex flex-wrap gap-2">
+              <n-button v-for="opt in pendingQuestion.options" :key="opt" size="small" @click="answerQuestion(opt)">
+                {{ opt }}
+              </n-button>
+            </div>
+            <div v-else class="text-xs text-om-dimmed">请在下方输入框中回答</div>
           </div>
 
           <!-- Approval dialog -->

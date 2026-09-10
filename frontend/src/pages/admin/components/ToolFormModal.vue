@@ -54,6 +54,10 @@
     engineJson: '{}',
     target: 'chat' as string,
     forceApprovalAbove: 'high' as string,
+    supportsApproval: false,
+    // Admin-only execution policy fields edited via the advanced JSON; kept
+    // verbatim so saving the form never drops them (denylist, risk rules...).
+    existingExecution: {} as Record<string, any>,
     params: [] as ParamDef[],
     mcpServers: [] as McpServerItem[],
     skills: [] as SkillItem[]
@@ -119,6 +123,8 @@
           engineJson: JSON.stringify(engineVal, null, 2),
           target: exec.target || 'chat',
           forceApprovalAbove: exec.force_approval_above || exec.forceApprovalAbove || 'high',
+          supportsApproval: !!(ext.supports_approval ?? ext.supportsApproval),
+          existingExecution: { ...exec },
           params,
           mcpServers,
           skills
@@ -135,6 +141,8 @@
           engineJson: '{}',
           target: 'chat',
           forceApprovalAbove: 'high',
+          supportsApproval: false,
+          existingExecution: {},
           params: [],
           mcpServers: [],
           skills: []
@@ -160,12 +168,20 @@
   function handleSubmit() {
     const validParams = form.value.params.filter((p) => p.key.trim())
 
+    // Preserve existing execution policy fields; drop legacy camelCase duplicates
+    // that would otherwise conflict with the snake_case values below.
+    const execution: Record<string, any> = { ...form.value.existingExecution }
+    delete execution.forceApprovalAbove
+    delete execution.commandDenylist
+    delete execution.riskOverrides
+    delete execution.riskRules
+    execution.target = form.value.target
+    execution.force_approval_above = form.value.forceApprovalAbove
+
     const options: Record<string, any> = {
+      options_version: 1,
       params: validParams,
-      execution: {
-        target: form.value.target,
-        force_approval_above: form.value.forceApprovalAbove
-      }
+      execution
     }
 
     if (form.value.toolType === 'external') {
@@ -174,7 +190,8 @@
         install_cmd: form.value.installCmd,
         launch_cmd: form.value.launchCmd,
         config_tpl: form.value.configTpl || '{}',
-        config_path: form.value.configPath || null
+        config_path: form.value.configPath || null,
+        supports_approval: form.value.supportsApproval
       }
     } else {
       let engine: Record<string, any> = {}
@@ -272,6 +289,11 @@
         </n-form-item>
         <n-form-item label="启动命令">
           <n-input v-model:value="form.launchCmd" placeholder="claude -p --output-format stream-json ..." />
+        </n-form-item>
+        <n-form-item label="支持审批">
+          <n-checkbox v-model:checked="form.supportsApproval">
+            <span class="text-xs">该 CLI 支持 stream-json 审批协议（勾选后用户可选择审批等级）</span>
+          </n-checkbox>
         </n-form-item>
         <n-form-item label="配置路径">
           <n-input v-model:value="form.configPath" placeholder="~/.claude/settings.json (optional)" />

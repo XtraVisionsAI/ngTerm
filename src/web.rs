@@ -1674,6 +1674,10 @@ pub struct StartAgentRequest {
     pub tool_id: Option<String>,
     #[serde(default)]
     pub target: Option<String>,
+    /// User-chosen approval level: `none`, `low`, `medium`, `high`,
+    /// `critical` or `all`. It can only tighten the administrator's policy.
+    #[serde(default)]
+    pub approval_level: Option<String>,
 }
 
 /// Everything resolved from the request before an agent is launched:
@@ -1777,7 +1781,18 @@ pub async fn resolve_agent_launch(
         }
     }
 
-    let exec_opts = tool.execution_options();
+    let exec_opts = match tool.execution_options() {
+        Ok(opts) => opts,
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: format!("Tool policy configuration is invalid: {}", e),
+                }),
+            )
+                .into_response())
+        }
+    };
 
     Ok(AgentLaunchContext {
         user_id,
@@ -1797,10 +1812,33 @@ pub async fn start_agent_inner(
     body: &StartAgentRequest,
 ) -> axum::response::Response {
     let tool_id = &ctx.tool.id;
-    let ext = ctx.tool.external_options().unwrap_or_default();
+    let ext = match ctx.tool.external_options() {
+        Ok(ext) => ext,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: format!("Tool configuration is invalid: {}", e),
+                }),
+            )
+                .into_response()
+        }
+    };
+    if ext.launch_cmd.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "Tool has no launch command configured".into(),
+            }),
+        )
+            .into_response();
+    }
 
+    // External CLIs run their own permission model. Only tools that declare
+    // `supports_approval` get platform-driven flags; for the rest the UI must
+    // not promise per-operation approval and we pass the command unchanged.
     let mut launch_cmd = ext.launch_cmd.clone();
-    if !body.require_approval {
+    if ext.supports_approval && !body.require_approval {
         launch_cmd.push_str(" --permission-mode acceptEdits");
     }
 
@@ -1858,6 +1896,7 @@ pub async fn start_agent_inner(
         .start(
             &agent_id,
             session_id,
+            &ctx.user_id,
             &state.helpers,
             &tool_context,
             &body.prompt,
@@ -1865,7 +1904,11 @@ pub async fn start_agent_inner(
         )
         .await
     {
-        Ok(()) => Json(serde_json::json!({ "agentId": agent_id })).into_response(),
+        Ok(()) => Json(serde_json::json!({
+            "agentId": agent_id,
+            "supportsApproval": ext.supports_approval,
+        }))
+        .into_response(),
         Err(e) => {
             tracing::error!("Agent start failed [{}]: {}", agent_id, e);
             (
@@ -1978,7 +2021,29 @@ async fn handle_create_tool(
 ) -> impl IntoResponse {
     match crate::ai_tool_registry::create_tool(&state.db, &req) {
         Ok(tool) => (StatusCode::CREATED, Json(tool)).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response(),
+        Err(e) => registry_error_response(e),
+    }
+}
+
+/// Map registry errors to HTTP: validation problems carry field-level
+/// details so the admin form can highlight the offending inputs.
+fn registry_error_response(e: crate::ai_tool_registry::RegistryError) -> axum::response::Response {
+    use crate::ai_tool_registry::RegistryError;
+    match e {
+        RegistryError::Validation(fields) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": RegistryError::Validation(fields.clone()).to_string(),
+                "fields": fields,
+            })),
+        )
+            .into_response(),
+        RegistryError::NotFound => StatusCode::NOT_FOUND.into_response(),
+        RegistryError::Db(msg) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: msg }),
+        )
+            .into_response(),
     }
 }
 
@@ -1991,11 +2056,7 @@ async fn handle_update_tool(
     match crate::ai_tool_registry::update_tool(&state.db, &id, &req) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError { error: e }),
-        )
-            .into_response(),
+        Err(e) => registry_error_response(e),
     }
 }
 

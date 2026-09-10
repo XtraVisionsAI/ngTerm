@@ -29,7 +29,14 @@ export interface RiskInfo {
   reason: string
 }
 
-export type AgentStatus = 'idle' | 'thinking' | 'tool_use' | 'waiting_approval' | 'disconnected' | 'error'
+export interface UserQuestion {
+  id: string
+  question: string
+  options: string[]
+}
+
+export type AgentStatus =
+  'idle' | 'thinking' | 'tool_use' | 'waiting_approval' | 'waiting_input' | 'disconnected' | 'error'
 
 export function useAgentSocket(agentId: string) {
   const auth = useAuthStore()
@@ -41,6 +48,11 @@ export function useAgentSocket(agentId: string) {
   const tokenUsage = ref<{ input: number; output: number }>({ input: 0, output: 0 })
   const costUsd = ref(0)
   const pendingApproval = ref<PermissionRequest | null>(null)
+  const pendingQuestion = ref<UserQuestion | null>(null)
+
+  function pushSystem(content: string) {
+    messages.value.push({ role: 'system', content, timestamp: Date.now() })
+  }
 
   let ws: WebSocket | null = null
   let didOpen = false
@@ -177,9 +189,26 @@ export function useAgentSocket(agentId: string) {
         risk: riskData ? { level: riskData.level as RiskInfo['level'], reason: riskData.reason as string } : undefined,
         target: (data.target as string) || undefined
       }
+    } else if (type === 'ask_user') {
+      status.value = 'waiting_input'
+      const opts = data.options
+      pendingQuestion.value = {
+        id: (data.id as string) || '',
+        question: (data.question as string) || '',
+        options: Array.isArray(opts) ? (opts as unknown[]).map((o) => String(o)) : []
+      }
+    } else if (type === 'permission_ack') {
+      const ackStatus = data.status as string | undefined
+      if (ackStatus && ackStatus !== 'applied') {
+        pushSystem(`审批未生效 (${ackStatus})，请重试或等待新的审批请求`)
+      }
+    } else if (type === 'gap') {
+      const dropped = (data.dropped as number | undefined) ?? 0
+      pushSystem(`输出过快，已丢弃 ${dropped} 条事件；以上内容可能不完整`)
     } else if (type === 'result') {
       status.value = 'idle'
       pendingApproval.value = null
+      pendingQuestion.value = null
       const usage = (data as Record<string, unknown>).usage as Record<string, number> | undefined
       if (usage) {
         tokenUsage.value = {
@@ -187,9 +216,15 @@ export function useAgentSocket(agentId: string) {
           output: usage.output_tokens || 0
         }
       }
-      const cost = (data as Record<string, unknown>).total_cost_usd as number | undefined
+      const cost =
+        ((data as Record<string, unknown>).cost_usd as number | undefined) ??
+        ((data as Record<string, unknown>).total_cost_usd as number | undefined)
       if (cost) {
         costUsd.value += cost
+      }
+      const stopReason = (data as Record<string, unknown>).stop_reason as string | undefined
+      if (stopReason === 'max_turns') {
+        pushSystem('已达到最大对话轮数限制，代理已停止')
       }
     } else if (type === 'user_message') {
       messages.value.push({
@@ -218,7 +253,13 @@ export function useAgentSocket(agentId: string) {
 
   function sendMessage(content: string) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return
-    ws.send(JSON.stringify({ type: 'message', content }))
+    if (pendingQuestion.value) {
+      // The agent is waiting on ask_user: route the text as the answer.
+      ws.send(JSON.stringify({ type: 'user_answer', id: pendingQuestion.value.id, answer: content }))
+      pendingQuestion.value = null
+    } else {
+      ws.send(JSON.stringify({ type: 'message', content }))
+    }
     messages.value.push({
       role: 'user',
       content,
@@ -227,16 +268,18 @@ export function useAgentSocket(agentId: string) {
     status.value = 'thinking'
   }
 
+  function answerQuestion(answer: string) {
+    sendMessage(answer)
+  }
+
   function respondPermission(granted: boolean) {
     if (!ws || ws.readyState !== WebSocket.OPEN || !pendingApproval.value) return
+    // Flat protocol: the server forwards {type, id, approved} to the agent as-is.
     ws.send(
       JSON.stringify({
         type: 'permission_response',
-        payload: {
-          type: 'permission_response',
-          id: pendingApproval.value.requestId,
-          approved: granted
-        }
+        id: pendingApproval.value.requestId,
+        approved: granted
       })
     )
     pendingApproval.value = null
@@ -258,8 +301,10 @@ export function useAgentSocket(agentId: string) {
     tokenUsage,
     costUsd,
     pendingApproval,
+    pendingQuestion,
     connect,
     sendMessage,
+    answerQuestion,
     respondPermission,
     close
   }

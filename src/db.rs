@@ -121,6 +121,13 @@ impl Database {
         // Seed built-in AI tools
         Self::seed_builtin_tools(&conn);
 
+        // Canonicalise stored tool options (legacy camelCase → snake_case).
+        match crate::ai_tool_registry::migrate_tool_options_conn(&conn) {
+            Ok(n) if n > 0 => tracing::info!("Migrated {} AI tool option document(s)", n),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("AI tool options migration failed: {}", e),
+        }
+
         // Incremental migrations: add columns if missing
         Self::add_column_if_missing(&conn, "servers", "host_key_fingerprint", "TEXT");
         Self::add_column_if_missing(&conn, "servers", "idle_timeout_secs", "INTEGER DEFAULT 0");

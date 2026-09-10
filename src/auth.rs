@@ -269,7 +269,8 @@ pub fn change_password(
     let user_secret = crypto::unwrap_secret(&old_wrapping_key, &encrypted_secret, &nonce)
         .map_err(|_| "Failed to decrypt secret".to_string())?;
 
-    store_credentials(db, user_id, new_password, &user_secret, pepper)?;
+    // Reuse the connection already held: `db.conn()` is not re-entrant.
+    store_credentials(&conn, user_id, new_password, &user_secret, pepper)?;
 
     Ok(())
 }
@@ -282,21 +283,21 @@ pub fn admin_reset_password(
     pepper: &str,
 ) -> Result<(), String> {
     let new_user_secret = crypto::generate_user_secret();
-    store_credentials(db, user_id, new_password, &new_user_secret, pepper)?;
+    let conn = db.conn();
+    store_credentials(&conn, user_id, new_password, &new_user_secret, pepper)?;
 
     // Clear all SSH keys for this user (old secret can't decrypt them anymore)
-    db.conn()
-        .execute(
-            "DELETE FROM keys WHERE user_id = ?1",
-            rusqlite::params![user_id],
-        )
-        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM keys WHERE user_id = ?1",
+        rusqlite::params![user_id],
+    )
+    .map_err(|e| e.to_string())?;
 
     Ok(())
 }
 
 fn store_credentials(
-    db: &Database,
+    conn: &rusqlite::Connection,
     user_id: &str,
     password: &str,
     user_secret: &[u8; 32],
@@ -308,7 +309,7 @@ fn store_credentials(
     let (encrypted_secret, nonce) =
         crypto::wrap_secret(&wrapping_key, user_secret).map_err(|e| e.to_string())?;
 
-    db.conn()
+    conn
         .execute(
             "UPDATE users SET password = ?1, kdf_salt = ?2, encrypted_secret = ?3, secret_nonce = ?4 WHERE id = ?5",
             rusqlite::params![password_hash, kdf_salt.as_slice(), encrypted_secret, nonce.as_slice(), user_id],

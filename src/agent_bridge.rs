@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc, Mutex};
@@ -16,15 +17,38 @@ pub enum AgentEvent {
     Exited { code: Option<u32> },
 }
 
+impl AgentEvent {
+    /// Wire representation sent to WebSocket clients and stored in history.
+    pub fn to_json_string(&self) -> String {
+        match self {
+            AgentEvent::Line(val) => val.to_string(),
+            AgentEvent::Error { error } => {
+                serde_json::json!({"type": "error", "error": error}).to_string()
+            }
+            AgentEvent::Exited { code } => {
+                serde_json::json!({"type": "exited", "code": code}).to_string()
+            }
+        }
+    }
+}
+
+type SharedScrollback = Arc<std::sync::Mutex<ScrollbackBuffer<String>>>;
+
 pub struct AgentSession {
+    /// Platform user who started the agent; every WS/HTTP access must match.
+    owner_user_id: String,
+    /// Monotonic token so a stale cleanup task cannot remove a newer session
+    /// registered under the same agent id.
+    generation: u64,
     stdin_tx: mpsc::Sender<Vec<u8>>,
     event_tx: broadcast::Sender<AgentEvent>,
-    scrollback: std::sync::Mutex<ScrollbackBuffer<String>>,
+    scrollback: SharedScrollback,
 }
 
 pub struct AgentBridge {
     sessions: Arc<Mutex<HashMap<String, AgentSession>>>,
     prepared: Arc<Mutex<HashSet<String>>>,
+    generation: AtomicU64,
 }
 
 pub struct AgentToolContext {
@@ -42,12 +66,49 @@ impl Default for AgentBridge {
     }
 }
 
+/// Persist events at the producer side: a recorder task subscribes to the
+/// broadcast channel as soon as the session is created, so history is kept
+/// even when no browser is attached and is never duplicated by multiple
+/// subscribers. A `gap` marker is recorded when the recorder itself lags.
+fn spawn_recorder(mut rx: broadcast::Receiver<AgentEvent>, scrollback: SharedScrollback) {
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let json = event.to_json_string();
+                    if let Ok(mut sb) = scrollback.lock() {
+                        sb.push(json);
+                    }
+                    if matches!(event, AgentEvent::Exited { .. }) {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("Agent history recorder lagged {} events", n);
+                    if let Ok(mut sb) = scrollback.lock() {
+                        sb.push(
+                            serde_json::json!({"type": "gap", "dropped": n, "source": "history"})
+                                .to_string(),
+                        );
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 impl AgentBridge {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             prepared: Arc::new(Mutex::new(HashSet::new())),
+            generation: AtomicU64::new(1),
         }
+    }
+
+    fn next_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst)
     }
 
     pub async fn prepare_tool(
@@ -100,10 +161,29 @@ impl AgentBridge {
         self.prepared.lock().await.contains(session_id)
     }
 
+    /// Build the launch command line. Environment values are passed through
+    /// `env` so they never appear in the (logged) command string itself.
+    fn build_launch_cmd(tool: &AgentToolContext, working_dir: Option<&str>) -> String {
+        let mut cmd = String::new();
+        if !tool.env_vars.is_empty() {
+            cmd.push_str("env ");
+            for (key, val) in &tool.env_vars {
+                cmd.push_str(&format!("{}={} ", key, crate::utils::shell_escape(val)));
+            }
+        }
+        cmd.push_str(&tool.launch_cmd);
+        if let Some(dir) = working_dir {
+            cmd.push_str(&format!(" --cwd {}", crate::utils::shell_escape(dir)));
+        }
+        cmd
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
         agent_id: &str,
         session_id: &str,
+        owner_user_id: &str,
         helpers: &HelperPool,
         tool: &AgentToolContext,
         initial_prompt: &str,
@@ -115,8 +195,17 @@ impl AgentBridge {
         }
 
         if helpers.is_local(session_id).await {
-            return Self::start_local(&mut sessions, agent_id, tool, initial_prompt, working_dir)
-                .await;
+            let generation = self.next_generation();
+            return Self::start_local(
+                &mut sessions,
+                agent_id,
+                owner_user_id,
+                generation,
+                tool,
+                initial_prompt,
+                working_dir,
+            )
+            .await;
         }
 
         // Run prepare if not already done
@@ -145,32 +234,30 @@ impl AgentBridge {
             helpers.exec_with_status(session_id, &write_cmd).await?;
         }
 
-        // Build launch command with env vars
-        let mut cmd = String::new();
-        if !tool.env_vars.is_empty() {
-            cmd.push_str("env ");
-            for (key, val) in &tool.env_vars {
-                cmd.push_str(&format!("{}={} ", key, crate::utils::shell_escape(val)));
-            }
-        }
-        cmd.push_str(&tool.launch_cmd);
-        if let Some(dir) = working_dir {
-            cmd.push_str(&format!(" --cwd {}", crate::utils::shell_escape(dir)));
-        }
+        let cmd = Self::build_launch_cmd(tool, working_dir);
 
-        // Step 5: Open channel and exec
+        // Open channel and exec. Only the tool's own launch command is logged:
+        // the full line carries credentials via `env`.
         let wrapped_cmd = format!("$SHELL -lic {} 2>&1", crate::utils::shell_escape(&cmd));
-        tracing::debug!("launch_command: {}", wrapped_cmd);
+        tracing::debug!(
+            "launching external agent: launch_cmd='{}', env_keys={:?}",
+            tool.launch_cmd,
+            tool.env_vars.keys().collect::<Vec<_>>()
+        );
 
         let channel = helpers.open_exec_channel(session_id, &wrapped_cmd).await?;
 
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
         let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let event_tx_clone = event_tx.clone();
+
+        // History recorder subscribes before any event can be produced.
+        let scrollback: SharedScrollback = Arc::new(std::sync::Mutex::new(ScrollbackBuffer::new()));
+        spawn_recorder(event_tx.subscribe(), scrollback.clone());
 
         let agent_session_id = agent_id.to_string();
         let helper_session_id = session_id.to_string();
         let sessions_ref = Arc::clone(&self.sessions);
+        let generation = self.next_generation();
 
         // Send initial prompt
         let initial_msg = serde_json::json!({
@@ -197,18 +284,10 @@ impl AgentBridge {
         helpers.add_user(session_id).await;
 
         // Spawn reader task
-        let event_tx_reader = event_tx_clone.clone();
+        let event_tx_reader = event_tx.clone();
         let session_id_reader = agent_session_id.clone();
         let sessions_ref_reader = Arc::clone(&sessions_ref);
         let helper_session_for_reader = helper_session_id.clone();
-        let helpers_for_reader = Arc::new(tokio::sync::Notify::new());
-        // We need a reference to HelperPool in the reader task for cleanup.
-        // Since HelperPool is behind Arc<AppState>, we store the session_id and
-        // handle cleanup externally. Instead, use a simpler approach: store the
-        // helpers reference via the sessions map removal triggering cleanup in web.rs.
-        // Actually, we can't hold &HelperPool across spawn. Use a different approach:
-        // store the helper_session_id and let the caller handle remove_user.
-        drop(helpers_for_reader);
 
         tokio::spawn(async move {
             use tokio::io::AsyncBufReadExt;
@@ -250,7 +329,14 @@ impl AgentBridge {
                 }
             }
 
-            sessions_ref_reader.lock().await.remove(&session_id_reader);
+            // Only remove the session this task belongs to.
+            let mut sessions = sessions_ref_reader.lock().await;
+            if sessions
+                .get(&session_id_reader)
+                .is_some_and(|s| s.generation == generation)
+            {
+                sessions.remove(&session_id_reader);
+            }
             tracing::info!(
                 "Agent session ended: {} (connection: {})",
                 session_id_reader,
@@ -273,16 +359,18 @@ impl AgentBridge {
             "content": initial_prompt
         })
         .to_string();
-
-        let mut scrollback = ScrollbackBuffer::new();
-        scrollback.push(initial_user_event);
+        if let Ok(mut sb) = scrollback.lock() {
+            sb.push(initial_user_event);
+        }
 
         sessions.insert(
             agent_session_id,
             AgentSession {
+                owner_user_id: owner_user_id.to_string(),
+                generation,
                 stdin_tx,
-                event_tx: event_tx_clone,
-                scrollback: std::sync::Mutex::new(scrollback),
+                event_tx,
+                scrollback,
             },
         );
 
@@ -290,11 +378,6 @@ impl AgentBridge {
     }
 
     pub async fn send_message(&self, agent_id: &str, content: &str) -> Result<(), String> {
-        let sessions = self.sessions.lock().await;
-        let session = sessions
-            .get(agent_id)
-            .ok_or_else(|| "Agent session not found".to_string())?;
-
         let msg = serde_json::json!({
             "type": "user",
             "message": {
@@ -302,14 +385,7 @@ impl AgentBridge {
                 "content": content
             }
         });
-        let mut bytes = serde_json::to_vec(&msg).unwrap();
-        bytes.push(b'\n');
-
-        session
-            .stdin_tx
-            .send(bytes)
-            .await
-            .map_err(|_| "Agent stdin closed".to_string())
+        self.send_raw(agent_id, &msg).await
     }
 
     pub async fn send_raw(&self, agent_id: &str, data: &serde_json::Value) -> Result<(), String> {
@@ -340,39 +416,83 @@ impl AgentBridge {
         self.sessions.lock().await.contains_key(agent_id)
     }
 
+    /// `None` when the agent does not exist; otherwise whether `user_id`
+    /// started it.
+    pub async fn is_owner(&self, agent_id: &str, user_id: &str) -> Option<bool> {
+        self.sessions
+            .lock()
+            .await
+            .get(agent_id)
+            .map(|s| s.owner_user_id == user_id)
+    }
+
+    pub async fn owner(&self, agent_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .await
+            .get(agent_id)
+            .map(|s| s.owner_user_id.clone())
+    }
+
     pub async fn stop(&self, agent_id: &str) {
         self.sessions.lock().await.remove(agent_id);
     }
 
+    /// Remove the session only if it is still the one identified by
+    /// `generation`; a task cleaning up an old run cannot delete a new one.
+    pub async fn stop_generation(&self, agent_id: &str, generation: u64) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(agent_id)
+            .is_some_and(|s| s.generation == generation)
+        {
+            sessions.remove(agent_id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Register an in-process (embedded) agent session whose stdin/event
     /// channels are driven by an external engine rather than a spawned CLI.
-    /// The caller is responsible for removing the session (via `stop`) when
-    /// the engine terminates.
+    ///
+    /// The history recorder subscribes here, so the caller must register
+    /// *before* producing any event. Returns the generation token to pass to
+    /// `stop_generation` when the engine terminates.
     pub async fn register_embedded(
         &self,
         agent_id: &str,
+        owner_user_id: &str,
         stdin_tx: mpsc::Sender<Vec<u8>>,
         event_tx: broadcast::Sender<AgentEvent>,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         let mut sessions = self.sessions.lock().await;
         if sessions.contains_key(agent_id) {
             return Err("Agent session already exists".to_string());
         }
+        let scrollback: SharedScrollback = Arc::new(std::sync::Mutex::new(ScrollbackBuffer::new()));
+        spawn_recorder(event_tx.subscribe(), scrollback.clone());
+        let generation = self.next_generation();
         sessions.insert(
             agent_id.to_string(),
             AgentSession {
+                owner_user_id: owner_user_id.to_string(),
+                generation,
                 stdin_tx,
                 event_tx,
-                scrollback: std::sync::Mutex::new(ScrollbackBuffer::new()),
+                scrollback,
             },
         );
-        Ok(())
+        Ok(generation)
     }
 
+    /// Record a client-originated entry (e.g. the user's own message).
     pub async fn push_scrollback(&self, agent_id: &str, data: String) {
         let sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get(agent_id) {
-            session.scrollback.lock().unwrap().push(data);
+            if let Ok(mut sb) = session.scrollback.lock() {
+                sb.push(data);
+            }
         }
     }
 
@@ -380,32 +500,28 @@ impl AgentBridge {
         let sessions = self.sessions.lock().await;
         sessions
             .get(agent_id)
-            .map(|s| s.scrollback.lock().unwrap().items().to_vec())
+            .and_then(|s| s.scrollback.lock().ok().map(|sb| sb.items().to_vec()))
             .unwrap_or_default()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_local(
         sessions: &mut HashMap<String, AgentSession>,
         agent_id: &str,
+        owner_user_id: &str,
+        generation: u64,
         tool: &AgentToolContext,
         initial_prompt: &str,
         working_dir: Option<&str>,
     ) -> Result<(), String> {
-        // Build launch command with env vars
-        let mut cmd = String::new();
-        if !tool.env_vars.is_empty() {
-            cmd.push_str("env ");
-            for (key, val) in &tool.env_vars {
-                cmd.push_str(&format!("{}={} ", key, crate::utils::shell_escape(val)));
-            }
-        }
-        cmd.push_str(&tool.launch_cmd);
-        if let Some(dir) = working_dir {
-            cmd.push_str(&format!(" --cwd {}", crate::utils::shell_escape(dir)));
-        }
+        let cmd = Self::build_launch_cmd(tool, working_dir);
 
         let wrapped_cmd = format!("$SHELL -lic {}", crate::utils::shell_escape(&cmd));
-        tracing::debug!("local agent launch: {}", wrapped_cmd);
+        tracing::debug!(
+            "launching local external agent: launch_cmd='{}', env_keys={:?}",
+            tool.launch_cmd,
+            tool.env_vars.keys().collect::<Vec<_>>()
+        );
 
         let mut child = tokio::process::Command::new("sh")
             .arg("-c")
@@ -421,7 +537,9 @@ impl AgentBridge {
 
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
         let (event_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let event_tx_clone = event_tx.clone();
+
+        let scrollback: SharedScrollback = Arc::new(std::sync::Mutex::new(ScrollbackBuffer::new()));
+        spawn_recorder(event_tx.subscribe(), scrollback.clone());
 
         let session_id = agent_id.to_string();
 
@@ -447,7 +565,7 @@ impl AgentBridge {
             .map_err(|e| format!("Failed to flush initial prompt: {}", e))?;
 
         // Spawn reader task
-        let event_tx_reader = event_tx_clone.clone();
+        let event_tx_reader = event_tx.clone();
         let session_id_reader = session_id.clone();
         tokio::spawn(async move {
             use tokio::io::AsyncBufReadExt;
@@ -483,6 +601,8 @@ impl AgentBridge {
                     }
                 }
             }
+            // Reap the child so it does not linger as a zombie.
+            let _ = child.wait().await;
             tracing::info!("Local agent session ended: {}", session_id_reader);
         });
 
@@ -501,19 +621,65 @@ impl AgentBridge {
             "content": initial_prompt
         })
         .to_string();
-
-        let mut scrollback = ScrollbackBuffer::new();
-        scrollback.push(initial_user_event);
+        if let Ok(mut sb) = scrollback.lock() {
+            sb.push(initial_user_event);
+        }
 
         sessions.insert(
             session_id,
             AgentSession {
+                owner_user_id: owner_user_id.to_string(),
+                generation,
                 stdin_tx,
-                event_tx: event_tx_clone,
-                scrollback: std::sync::Mutex::new(scrollback),
+                event_tx,
+                scrollback,
             },
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn embedded_sessions_track_owner_generation_and_history() {
+        let bridge = AgentBridge::new();
+        let (stdin_tx, _stdin_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (event_tx, _) = broadcast::channel(16);
+
+        let generation = bridge
+            .register_embedded("agent-1", "alice", stdin_tx.clone(), event_tx.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(bridge.is_owner("agent-1", "alice").await, Some(true));
+        assert_eq!(bridge.is_owner("agent-1", "bob").await, Some(false));
+        assert_eq!(bridge.is_owner("agent-9", "alice").await, None);
+
+        // Duplicate registration is refused.
+        assert!(bridge
+            .register_embedded("agent-1", "alice", stdin_tx.clone(), event_tx.clone())
+            .await
+            .is_err());
+
+        // Events are recorded without any WebSocket subscriber.
+        event_tx
+            .send(AgentEvent::Line(
+                serde_json::json!({"type": "assistant_delta", "text": "hi"}),
+            ))
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let history = bridge.get_scrollback("agent-1").await;
+        assert_eq!(history.len(), 1);
+        assert!(history[0].contains("assistant_delta"));
+
+        // A stale generation cannot remove the live session.
+        assert!(!bridge.stop_generation("agent-1", generation + 100).await);
+        assert!(bridge.is_active("agent-1").await);
+        assert!(bridge.stop_generation("agent-1", generation).await);
+        assert!(!bridge.is_active("agent-1").await);
     }
 }

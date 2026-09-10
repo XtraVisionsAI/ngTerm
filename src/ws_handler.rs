@@ -160,8 +160,42 @@ async fn handle_ws(socket: WebSocket, session_id: String, state: Arc<AppState>) 
 enum AgentClientMsg {
     #[serde(rename = "message")]
     Message { content: String },
+    /// Approval decision. Accepts both the flat form
+    /// `{type, id, approved}` and the legacy nested `{type, payload: {...}}`.
     #[serde(rename = "permission_response")]
-    PermissionResponse { payload: serde_json::Value },
+    PermissionResponse {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        approved: Option<bool>,
+        #[serde(default)]
+        payload: Option<serde_json::Value>,
+    },
+    /// Answer to an `ask_user` question.
+    #[serde(rename = "user_answer")]
+    UserAnswer { id: String, answer: String },
+}
+
+/// Normalise a permission response into the flat wire form the agent side
+/// understands. Returns `None` when no request id can be found.
+fn normalize_permission_response(
+    id: Option<String>,
+    approved: Option<bool>,
+    payload: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let from_payload = |key: &str| payload.as_ref().and_then(|p| p.get(key).cloned());
+    let id = id
+        .filter(|s| !s.is_empty())
+        .or_else(|| from_payload("id").and_then(|v| v.as_str().map(|s| s.to_string())))
+        .filter(|s| !s.is_empty())?;
+    let approved = approved
+        .or_else(|| from_payload("approved").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    Some(serde_json::json!({
+        "type": "permission_response",
+        "id": id,
+        "approved": approved,
+    }))
 }
 
 pub async fn ws_agent(
@@ -170,30 +204,60 @@ pub async fn ws_agent(
     Query(query): Query<WsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    if query
+    let user_id = match query
         .token
         .as_ref()
         .and_then(|t| auth::verify_token(t, &state.config.jwt_secret))
-        .is_none()
     {
-        return Response::builder()
-            .status(401)
-            .body(axum::body::Body::from("Unauthorized"))
-            .unwrap();
-    }
-
-    ws.on_upgrade(move |socket| handle_agent_ws(socket, agent_id, state))
-}
-
-async fn handle_agent_ws(socket: WebSocket, agent_id: String, state: Arc<AppState>) {
-    let mut event_rx = match state.agents.subscribe(&agent_id).await {
-        Some(rx) => rx,
-        None => return,
+        Some((uid, _role)) => uid,
+        None => {
+            return Response::builder()
+                .status(401)
+                .body(axum::body::Body::from("Unauthorized"))
+                .unwrap();
+        }
     };
 
+    // Ownership is checked before the upgrade so the caller gets a definite
+    // HTTP status instead of a silently closed socket.
+    match state.agents.is_owner(&agent_id, &user_id).await {
+        None => {
+            return Response::builder()
+                .status(404)
+                .body(axum::body::Body::from("Agent not found"))
+                .unwrap();
+        }
+        Some(false) => {
+            return Response::builder()
+                .status(403)
+                .body(axum::body::Body::from("Forbidden"))
+                .unwrap();
+        }
+        Some(true) => {}
+    }
+
+    ws.on_upgrade(move |socket| handle_agent_ws(socket, agent_id, user_id, state))
+}
+
+async fn handle_agent_ws(
+    socket: WebSocket,
+    agent_id: String,
+    user_id: String,
+    state: Arc<AppState>,
+) {
     let (mut ws_sink, mut ws_stream) = socket.split();
 
-    // Replay scrollback history
+    let mut event_rx = match state.agents.subscribe(&agent_id).await {
+        Some(rx) => rx,
+        None => {
+            let msg = serde_json::json!({"type": "error", "error": "Agent not found"});
+            let _ = ws_sink.send(Message::Text(msg.to_string().into())).await;
+            let _ = ws_sink.send(Message::Close(None)).await;
+            return;
+        }
+    };
+
+    // Replay history (recorded at the producer side, independent of clients).
     let history = state.agents.get_scrollback(&agent_id).await;
     let has_history = !history.is_empty();
     for json in history {
@@ -211,16 +275,7 @@ async fn handle_agent_ws(socket: WebSocket, agent_id: String, state: Arc<AppStat
             result = event_rx.recv() => {
                 match result {
                     Ok(event) => {
-                        let json = match &event {
-                            AgentEvent::Line(val) => val.to_string(),
-                            AgentEvent::Error { error } => {
-                                serde_json::json!({"type": "error", "error": error}).to_string()
-                            }
-                            AgentEvent::Exited { code } => {
-                                serde_json::json!({"type": "exited", "code": code}).to_string()
-                            }
-                        };
-                        state.agents.push_scrollback(&agent_id, json.clone()).await;
+                        let json = event.to_json_string();
                         if ws_sink.send(Message::Text(json.into())).await.is_err() {
                             break;
                         }
@@ -230,6 +285,11 @@ async fn handle_agent_ws(socket: WebSocket, agent_id: String, state: Arc<AppStat
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("Agent WS client lagged {} messages for {}", n, agent_id);
+                        // Tell the client its view is incomplete instead of pretending.
+                        let msg = serde_json::json!({"type": "gap", "dropped": n, "source": "live"});
+                        if ws_sink.send(Message::Text(msg.to_string().into())).await.is_err() {
+                            break;
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         let msg = serde_json::json!({"type": "exited", "code": null});
@@ -241,19 +301,49 @@ async fn handle_agent_ws(socket: WebSocket, agent_id: String, state: Arc<AppStat
             msg = ws_stream.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Ok(client_msg) = serde_json::from_str::<AgentClientMsg>(&text) {
-                            match client_msg {
-                                AgentClientMsg::Message { ref content } => {
-                                    let user_event = serde_json::json!({
-                                        "type": "user_message",
-                                        "content": content
-                                    });
-                                    state.agents.push_scrollback(&agent_id, user_event.to_string()).await;
-                                    let _ = state.agents.send_message(&agent_id, content).await;
+                        // Re-check ownership per message: the agent may have been
+                        // stopped and restarted by another principal meanwhile.
+                        if state.agents.is_owner(&agent_id, &user_id).await != Some(true) {
+                            let msg = serde_json::json!({"type": "error", "error": "Agent no longer available"});
+                            let _ = ws_sink.send(Message::Text(msg.to_string().into())).await;
+                            break;
+                        }
+                        match serde_json::from_str::<AgentClientMsg>(&text) {
+                            Ok(AgentClientMsg::Message { ref content }) => {
+                                let user_event = serde_json::json!({
+                                    "type": "user_message",
+                                    "content": content
+                                });
+                                state.agents.push_scrollback(&agent_id, user_event.to_string()).await;
+                                let _ = state.agents.send_message(&agent_id, content).await;
+                            }
+                            Ok(AgentClientMsg::PermissionResponse { id, approved, payload }) => {
+                                match normalize_permission_response(id, approved, payload) {
+                                    Some(normalized) => {
+                                        let _ = state.agents.send_raw(&agent_id, &normalized).await;
+                                    }
+                                    None => {
+                                        let msg = serde_json::json!({
+                                            "type": "permission_ack", "id": "", "status": "invalid",
+                                            "error": "permission_response requires an id"
+                                        });
+                                        let _ = ws_sink.send(Message::Text(msg.to_string().into())).await;
+                                    }
                                 }
-                                AgentClientMsg::PermissionResponse { payload } => {
-                                    let _ = state.agents.send_raw(&agent_id, &payload).await;
-                                }
+                            }
+                            Ok(AgentClientMsg::UserAnswer { id, answer }) => {
+                                let normalized = serde_json::json!({
+                                    "type": "user_answer", "id": id, "answer": answer
+                                });
+                                state.agents.push_scrollback(
+                                    &agent_id,
+                                    serde_json::json!({"type": "user_message", "content": answer}).to_string(),
+                                ).await;
+                                let _ = state.agents.send_raw(&agent_id, &normalized).await;
+                            }
+                            Err(_) => {
+                                let msg = serde_json::json!({"type": "error", "error": "Unrecognised client message"});
+                                let _ = ws_sink.send(Message::Text(msg.to_string().into())).await;
                             }
                         }
                     }
@@ -262,5 +352,29 @@ async fn handle_agent_ws(socket: WebSocket, agent_id: String, state: Arc<AppStat
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_response_accepts_flat_and_nested_forms() {
+        let flat = normalize_permission_response(Some("t1".into()), Some(true), None).unwrap();
+        assert_eq!(flat["id"], "t1");
+        assert_eq!(flat["approved"], true);
+
+        let nested = normalize_permission_response(
+            None,
+            None,
+            Some(serde_json::json!({"type": "permission_response", "id": "t2", "approved": false})),
+        )
+        .unwrap();
+        assert_eq!(nested["id"], "t2");
+        assert_eq!(nested["approved"], false);
+
+        assert!(normalize_permission_response(None, Some(true), None).is_none());
+        assert!(normalize_permission_response(Some(String::new()), Some(true), None).is_none());
     }
 }

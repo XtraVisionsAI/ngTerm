@@ -43,11 +43,13 @@ async fn main() {
     audit::close_stale_sessions(&database);
 
     if let Some(master_key) = auth::init_admin(&data_dir, args.master_key.as_deref()) {
-        tracing::info!("========================================");
-        tracing::info!("  First run! Admin master key:");
-        tracing::info!("  {}", master_key);
-        tracing::info!("  Save this key! It will NOT be shown again.");
-        tracing::info!("========================================");
+        // Printed directly to stderr: credentials must not enter the
+        // structured log stream (which may be shipped or indexed).
+        eprintln!();
+        eprintln!("  First run! Admin master key:");
+        eprintln!("  {}", master_key);
+        eprintln!("  Save this key! It will NOT be shown again.");
+        eprintln!();
     }
 
     let pepper = auth::read_pepper(&data_dir);
