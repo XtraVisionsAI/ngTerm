@@ -80,6 +80,34 @@ declare module 'vue-router/auto-routes' {
       Record<never, never>,
       | never
     >,
+    '/audit/components/audit-connections': RouteRecordInfo<
+      '/audit/components/audit-connections',
+      '/audit/components/audit-connections',
+      Record<never, never>,
+      Record<never, never>,
+      | never
+    >,
+    '/audit/components/audit-operations': RouteRecordInfo<
+      '/audit/components/audit-operations',
+      '/audit/components/audit-operations',
+      Record<never, never>,
+      Record<never, never>,
+      | never
+    >,
+    '/audit/components/audit-sessions': RouteRecordInfo<
+      '/audit/components/audit-sessions',
+      '/audit/components/audit-sessions',
+      Record<never, never>,
+      Record<never, never>,
+      | never
+    >,
+    '/audit/recordings/[id]': RouteRecordInfo<
+      '/audit/recordings/[id]',
+      '/audit/recordings/:id',
+      { id: ParamValue<true> },
+      { id: ParamValue<false> },
+      | never
+    >,
     '/login': RouteRecordInfo<
       '/login',
       '/login',
@@ -162,6 +190,38 @@ declare module 'vue-router/auto-routes' {
         | never
       pathParamNames:
         | never
+    }
+    'src/pages/audit/components/audit-connections.vue': {
+      routes:
+        | '/audit/components/audit-connections'
+      views:
+        | never
+      pathParamNames:
+        | never
+    }
+    'src/pages/audit/components/audit-operations.vue': {
+      routes:
+        | '/audit/components/audit-operations'
+      views:
+        | never
+      pathParamNames:
+        | never
+    }
+    'src/pages/audit/components/audit-sessions.vue': {
+      routes:
+        | '/audit/components/audit-sessions'
+      views:
+        | never
+      pathParamNames:
+        | never
+    }
+    'src/pages/audit/recordings/[id].vue': {
+      routes:
+        | '/audit/recordings/[id]'
+      views:
+        | never
+      pathParamNames:
+        | 'id'
     }
     'src/pages/login.vue': {
       routes:

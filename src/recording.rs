@@ -338,11 +338,7 @@ impl RecordingStore {
     pub fn new(db: Database, config: RecordingConfig) -> Result<Arc<Self>, String> {
         std::fs::create_dir_all(&config.root)
             .map_err(|e| format!("cannot create recording dir {:?}: {}", config.root, e))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&config.root, std::fs::Permissions::from_mode(0o700));
-        }
+        restrict_permissions(&config.root, 0o700);
         Ok(Arc::new(Self { db, config }))
     }
 
@@ -759,6 +755,19 @@ impl RecordingStore {
     }
 }
 
+/// Recordings hold terminal content; keep them owner-only on unix.
+fn restrict_permissions(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+}
+
 fn decompress(bytes: &[u8]) -> Result<String, String> {
     use std::io::Read;
     let mut out = String::new();
@@ -780,6 +789,7 @@ fn write_chunk_file(
 ) -> Result<ChunkMeta, String> {
     let dir = root.join(recording_id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {:?}: {}", dir, e))?;
+    restrict_permissions(&dir, 0o700);
     let header = serde_json::json!({
         "v": RECORDING_FORMAT_VERSION,
         "recordingId": recording_id,
@@ -799,6 +809,7 @@ fn write_chunk_file(
     let final_path = dir.join(&file_name);
     let tmp_path = dir.join(format!("{:06}.part", seq));
     std::fs::write(&tmp_path, &compressed).map_err(|e| format!("write {:?}: {}", tmp_path, e))?;
+    restrict_permissions(&tmp_path, 0o600);
     std::fs::rename(&tmp_path, &final_path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_path);
         format!("rename {:?}: {}", final_path, e)
@@ -1149,6 +1160,24 @@ mod tests {
             assert!(!text.contains(&B64.encode(b"secret-password\r")));
         }
         assert!(fx.store.verify(&rid).unwrap().is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let chunk = &fx.store.chunks(&rid).unwrap()[0];
+            let file = fx.dir.join("recordings").join(&chunk.path);
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(file.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
     }
 
     #[tokio::test]
