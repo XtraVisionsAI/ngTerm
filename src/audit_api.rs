@@ -321,6 +321,51 @@ pub async fn list_system_events(
     }
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrityQuery {
+    /// How many of the newest recordings to verify chunk by chunk (max 200).
+    pub recordings: Option<u32>,
+}
+
+/// On-demand integrity check: append-only guards, stream continuity and
+/// chunk hashes of recent recordings. Admin only; the check is itself
+/// recorded as an access event.
+pub async fn integrity(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Query(q): Query<IntegrityQuery>,
+) -> Response {
+    if !caller.is_admin {
+        return err(StatusCode::FORBIDDEN, "Admin required");
+    }
+    let limit = q.recordings.unwrap_or(50).clamp(0, MAX_PAGE);
+    let db = state.db.clone();
+    let store = state.recordings.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        crate::audit_maintenance::integrity_report(&db, store.as_ref(), limit)
+    })
+    .await;
+    match report {
+        Ok(Ok(report)) => {
+            record_access(
+                &state,
+                &caller,
+                "audit.integrity_check",
+                serde_json::json!({
+                    "recordingsChecked": report.recordings_checked,
+                    "recordingsWithProblems": report.recordings_with_problems.len(),
+                    "streamGaps": report.stream_gaps.len(),
+                    "guardsPresent": report.append_only_guards_present,
+                }),
+            );
+            Json(report).into_response()
+        }
+        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 // --- Recordings ---------------------------------------------------------------
 
 /// A recording the caller may read, resolved through its session's owner.
@@ -872,6 +917,37 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(v["current"]["sessionsClosed"], 0);
+    }
+
+    #[tokio::test]
+    async fn integrity_check_is_admin_only_and_recorded() {
+        let state = test_state().await;
+        let resp = integrity(
+            State(state.clone()),
+            user("u1"),
+            Query(IntegrityQuery::default()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let (st, v) = body_json(
+            integrity(
+                State(state.clone()),
+                admin(),
+                Query(IntegrityQuery::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["appendOnlyGuardsPresent"], true);
+        assert!(v["limitation"]
+            .as_str()
+            .unwrap()
+            .contains("full control of the host"));
+        let access = audit_events::events_after(&state.db, ACCESS_STREAM, 0, 10).unwrap();
+        assert!(access
+            .iter()
+            .any(|e| e.event_type == "audit.integrity_check"));
     }
 
     #[tokio::test]

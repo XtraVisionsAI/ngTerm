@@ -23,6 +23,11 @@ const MIGRATIONS: &[(u32, &str, MigrationStep)] = &[
         "terminal recordings and chunk index",
         crate::recording::migration_v3_recordings,
     ),
+    (
+        4,
+        "append-only guards and maintenance window for audit tables",
+        crate::audit_maintenance::migration_v4_append_only,
+    ),
 ];
 
 impl Database {

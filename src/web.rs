@@ -165,6 +165,7 @@ pub fn build_router_with_hooks(state: Arc<AppState>, hooks: RouterHooks) -> Rout
         )
         .route("/audit/export", get(audit_api::export))
         .route("/audit/system", get(audit_api::list_system_events))
+        .route("/audit/integrity", get(audit_api::integrity))
         // UI State
         .route("/ui-state", get(handle_get_ui_state))
         .route("/ui-state", put(handle_save_ui_state));

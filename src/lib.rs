@@ -4,6 +4,7 @@ pub mod audit;
 pub mod audit_api;
 pub mod audit_config;
 pub mod audit_events;
+pub mod audit_maintenance;
 pub mod audit_ops;
 pub mod audit_system;
 pub mod auth;
@@ -83,6 +84,21 @@ pub async fn build_app_state(
             report
         }
     };
+    // Administrator retention for audit rows (NGTERM_AUDIT_RETENTION_DAYS);
+    // the only sanctioned way audit history is ever removed.
+    let retention = audit_maintenance::RetentionPolicy::from_env();
+    match retention {
+        Some(p) => tracing::info!(
+            "Audit retention: rows older than {} day(s) are purged",
+            p.days
+        ),
+        None => tracing::info!("Audit retention: keep forever (NGTERM_AUDIT_RETENTION_DAYS unset)"),
+    }
+    audit_maintenance::spawn_retention_task(
+        db.clone(),
+        retention,
+        std::time::Duration::from_secs(3600),
+    );
     let (session_manager, session_ended_rx) =
         session_manager::SessionManager::new(recordings.clone());
 

@@ -477,6 +477,21 @@ impl RecordingStore {
         rows.next().transpose().map_err(|e| e.to_string())
     }
 
+    /// Newest finished recordings first, for bounded verification sweeps.
+    pub fn list_recent(&self, limit: u32) -> Result<Vec<RecordingMeta>, String> {
+        let conn = self.db.conn();
+        let mut stmt = conn
+            .prepare(&format!(
+                "{} WHERE status != 'recording' ORDER BY started_at DESC LIMIT ?1",
+                Self::META_SELECT
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![limit], Self::row_to_meta)
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+    }
+
     pub fn list_for_session(&self, session_id: &str) -> Result<Vec<RecordingMeta>, String> {
         let conn = self.db.conn();
         let mut stmt = conn
@@ -670,19 +685,22 @@ impl RecordingStore {
             }
         }
         let _ = std::fs::remove_dir(self.config.root.join(recording_id));
+        // Index rows are guarded against deletion outside a maintenance
+        // window; retention is the sanctioned path.
         let mut conn = self.db.conn();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute(
-            "DELETE FROM audit_recording_chunks WHERE recording_id = ?1",
-            params![recording_id],
-        )
-        .map_err(|e| e.to_string())?;
-        tx.execute(
-            "DELETE FROM audit_recordings WHERE recording_id = ?1",
-            params![recording_id],
-        )
-        .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())?;
+        crate::audit_maintenance::with_maintenance_window(&mut conn, |tx| {
+            tx.execute(
+                "DELETE FROM audit_recording_chunks WHERE recording_id = ?1",
+                params![recording_id],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute(
+                "DELETE FROM audit_recordings WHERE recording_id = ?1",
+                params![recording_id],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })?;
         Ok(freed)
     }
 
@@ -756,7 +774,7 @@ impl RecordingStore {
 }
 
 /// Recordings hold terminal content; keep them owner-only on unix.
-fn restrict_permissions(path: &Path, mode: u32) {
+pub(crate) fn restrict_permissions(path: &Path, mode: u32) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

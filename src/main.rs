@@ -22,6 +22,11 @@ struct Args {
     /// Specify master key for first-run initialization (ignored if already initialized)
     #[arg(long)]
     master_key: Option<String>,
+
+    /// Write a consistent backup (database snapshot + finished recording
+    /// chunks + manifest) into this empty directory and exit.
+    #[arg(long, value_name = "DIR")]
+    backup_to: Option<String>,
 }
 
 #[tokio::main]
@@ -39,6 +44,19 @@ async fn main() {
     std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
 
     let database = db::Database::open(&data_dir).expect("Failed to open database");
+
+    if let Some(dest) = args.backup_to.as_deref() {
+        match ngterm::audit_maintenance::backup_cli(&database, &data_dir, dest) {
+            Ok(manifest) => {
+                println!("{}", manifest);
+                return;
+            }
+            Err(e) => {
+                eprintln!("backup failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     audit::close_stale_sessions(&database);
 

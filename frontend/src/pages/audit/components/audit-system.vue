@@ -1,7 +1,7 @@
 <script setup lang="ts">
   import type { DataTableColumns } from 'naive-ui'
   import type { AuditEvent, StartupReport } from '@/utils/audit'
-  import { NAlert, NButton, NDataTable, NEmpty, NTag, useMessage } from 'naive-ui'
+  import { NAlert, NButton, NDataTable, NEmpty, NSpace, NTag, useMessage } from 'naive-ui'
   import { h, onMounted, ref } from 'vue'
   import { useApi } from '@/composables/useApi'
   import { formatTime } from '@/utils/format'
@@ -12,6 +12,29 @@
   const items = ref<AuditEvent[]>([])
   const current = ref<StartupReport | null>(null)
   const loading = ref(false)
+
+  interface IntegrityReport {
+    checkedAt: string
+    appendOnlyGuardsPresent: boolean
+    streamsChecked: number
+    streamGaps: { streamId: string; afterSeq: number; nextSeq: number }[]
+    recordingsChecked: number
+    recordingsWithProblems: { recordingId: string; sessionId: string; problems: unknown[] }[]
+    limitation: string
+  }
+  const integrity = ref<IntegrityReport | null>(null)
+  const checking = ref(false)
+
+  async function runIntegrityCheck() {
+    checking.value = true
+    try {
+      integrity.value = await api.get<IntegrityReport>('/audit/integrity?recordings=100')
+    } catch (e) {
+      message.error((e as Error).message)
+    } finally {
+      checking.value = false
+    }
+  }
 
   async function load() {
     loading.value = true
@@ -89,8 +112,44 @@
       <p class="text-xs opacity-60">
         每次服务启动与正常关停都会记录；启动时若发现上一进程未正常关停，其遗留的会话、操作与录像会被标记为中断而不是完整。
       </p>
-      <n-button size="small" :loading="loading" @click="load">刷新</n-button>
+      <n-space size="small">
+        <n-button size="small" :loading="checking" @click="runIntegrityCheck">完整性检查</n-button>
+        <n-button size="small" :loading="loading" @click="load">刷新</n-button>
+      </n-space>
     </div>
+    <n-alert
+      v-if="integrity"
+      :type="
+        !integrity.appendOnlyGuardsPresent || integrity.streamGaps.length || integrity.recordingsWithProblems.length
+          ? 'error'
+          : 'success'
+      "
+      class="mb-3"
+      :title="`完整性检查 · ${formatTime(integrity.checkedAt)}`"
+      closable
+      @close="integrity = null"
+    >
+      <div class="text-xs">
+        <p>追加写保护：{{ integrity.appendOnlyGuardsPresent ? '触发器在位' : '触发器缺失（数据库可能被直接改动）' }}</p>
+        <p>
+          事件流：检查 {{ integrity.streamsChecked }} 条，
+          <template v-if="integrity.streamGaps.length">
+            发现 {{ integrity.streamGaps.length }} 处序号缺口：
+            {{ integrity.streamGaps.map((g) => `${g.streamId} #${g.afterSeq}→#${g.nextSeq}`).join('；') }}
+          </template>
+          <template v-else>序号连续</template>
+        </p>
+        <p>
+          录像：校验最近 {{ integrity.recordingsChecked }} 段，
+          <template v-if="integrity.recordingsWithProblems.length">
+            {{ integrity.recordingsWithProblems.length }} 段有缺块或校验失败：
+            {{ integrity.recordingsWithProblems.map((r) => r.recordingId).join('，') }}
+          </template>
+          <template v-else>全部通过</template>
+        </p>
+        <p class="mt-1 opacity-60">{{ integrity.limitation }}</p>
+      </div>
+    </n-alert>
     <n-alert
       v-if="current && current.previousShutdownClean === false"
       type="warning"
