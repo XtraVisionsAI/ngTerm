@@ -12,7 +12,7 @@ cargo fmt --check || {
 
 # Rust: clippy
 echo "  cargo clippy"
-cargo clippy -- -D warnings 2>/dev/null || {
+cargo clippy -- -D warnings || {
     echo "❌ cargo clippy failed. Fix warnings above."
     exit 1
 }

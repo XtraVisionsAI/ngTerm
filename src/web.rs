@@ -9,6 +9,7 @@ use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(debug_assertions)]
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -923,6 +924,9 @@ async fn handle_delete_session(
     AuthUser(user_id): AuthUser,
 ) -> impl IntoResponse {
     if state.sessions.remove_session(&id, &user_id) {
+        // An agent bound to this terminal cannot outlive it: dropping the
+        // session closes its stdin, which stops the engine / CLI.
+        state.agents.stop(&format!("agent-{}", id)).await;
         state.helpers.remove(&id).await;
         let _ = audit::log_disconnect(&state.db, &id, "user_closed");
         StatusCode::NO_CONTENT.into_response()
