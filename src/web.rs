@@ -24,6 +24,7 @@ use crate::auth;
 use crate::config::limits;
 use crate::crypto;
 use crate::extractors::{AdminUser, AuthUser, Caller};
+use crate::file_ops;
 use crate::key_manager::{self, CreateKeyRequest};
 use crate::metrics;
 use crate::server_registry::{self, CreateServerRequest};
@@ -112,6 +113,7 @@ pub fn build_router_with_hooks(state: Arc<AppState>, hooks: RouterHooks) -> Rout
         // Files (SFTP)
         .route("/sessions/{id}/files", get(handle_list_files))
         .route("/sessions/{id}/files/content", get(handle_read_file))
+        .route("/sessions/{id}/files/restore", post(handle_restore_file))
         .route(
             "/sessions/{id}/files/content",
             put(handle_write_file).layer(DefaultBodyLimit::max(limits::MAX_FILE_WRITE_BYTES)),
@@ -1513,6 +1515,12 @@ struct FileQuery {
 struct WriteFileRequest {
     path: String,
     content: String,
+    /// Hash the client previewed against (`file_ops::Baseline::binding`):
+    /// the write is refused with 409 when the file differs now.
+    baseline_sha256: Option<String>,
+    /// Keep a copy of the current content next to the file (default true
+    /// when the file exists).
+    backup: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1725,23 +1733,273 @@ async fn handle_write_file(
         return (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response();
     }
 
-    let summary = format!("write {} ({} bytes)", req.path, req.content.len());
-    match audit_ops::run(
+    // What the file is right now. A client that previewed a diff sends the
+    // hash it previewed against; a different file now means the preview no
+    // longer describes the change and the write is refused.
+    let baseline = match file_ops::read_baseline(&state, &session_id, &req.path).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError { error: e }),
+            )
+                .into_response()
+        }
+    };
+    if let Some(expected) = req.baseline_sha256.as_deref() {
+        if expected != baseline.binding() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "file changed since it was previewed; reload and review again",
+                    "code": "baseline_mismatch",
+                    "baseline": baseline,
+                })),
+            )
+                .into_response();
+        }
+    }
+    let want_backup = req.backup.unwrap_or(true) && baseline.exists;
+    let summary = format!(
+        "write {} ({} bytes; baseline {})",
+        req.path,
+        req.content.len(),
+        baseline.short_binding()
+    );
+    verified_write(
         &state,
         &session_id,
         &user_id,
+        &req.path,
+        req.content.as_bytes(),
+        summary,
+        baseline,
+        want_backup,
+    )
+    .await
+}
+
+/// Managed file write with backup and read-back verification. The
+/// operation is recorded before anything is sent; every step leaves an
+/// event on it, and a write whose read-back does not match is a *failed*
+/// operation with the evidence attached, not a success.
+#[allow(clippy::too_many_arguments)]
+async fn verified_write(
+    state: &Arc<AppState>,
+    session_id: &str,
+    user_id: &str,
+    path: &str,
+    content: &[u8],
+    summary: String,
+    baseline: file_ops::Baseline,
+    want_backup: bool,
+) -> axum::response::Response {
+    let managed = match audit_ops::run_begin(
+        state,
+        session_id,
+        user_id,
         OperationKind::FileWrite,
         summary,
         None,
-        state
-            .helpers
-            .sftp_write(&session_id, &req.path, req.content.as_bytes()),
     )
     .await
     {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => op_error_response(e),
+        Ok(m) => m,
+        Err(e) => return op_error_response(e),
+    };
+    let op_id = managed.id().to_string();
+    file_ops::record_event(
+        &state.db,
+        session_id,
+        &op_id,
+        file_ops::EVENT_BASELINE,
+        serde_json::json!({
+            "path": path,
+            "exists": baseline.exists,
+            "sha256": baseline.sha256,
+            "size": baseline.size,
+            "tooLarge": baseline.too_large,
+        }),
+    );
+    let mut backup_path = None;
+    if want_backup {
+        match file_ops::backup_file(state, session_id, path).await {
+            Ok((bp, sha)) => {
+                file_ops::record_event(
+                    &state.db,
+                    session_id,
+                    &op_id,
+                    file_ops::EVENT_BACKUP,
+                    serde_json::json!({ "backupPath": bp, "sha256": sha }),
+                );
+                backup_path = Some(bp);
+            }
+            Err(e) => {
+                // Nothing was written: the file is untouched.
+                managed.failed(&format!("{}; nothing written", e));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError {
+                        error: format!("{}; the file was not modified", e),
+                    }),
+                )
+                    .into_response();
+            }
+        }
     }
+    if let Err(e) = state.helpers.sftp_write(session_id, path, content).await {
+        managed.failed(&e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError { error: e }),
+        )
+            .into_response();
+    }
+    let expected = file_ops::sha256_hex(content);
+    match file_ops::read_back_hash(state, session_id, path).await {
+        Ok(actual) if actual == expected => {
+            file_ops::record_event(
+                &state.db,
+                session_id,
+                &op_id,
+                file_ops::EVENT_VERIFIED,
+                serde_json::json!({ "sha256": actual, "bytes": content.len() }),
+            );
+            managed.succeeded();
+            Json(file_ops::WriteReport {
+                operation_id: op_id,
+                path: path.to_string(),
+                sha256: expected,
+                verified: true,
+                backup_path,
+                baseline,
+            })
+            .into_response()
+        }
+        Ok(actual) => {
+            file_ops::record_event(
+                &state.db,
+                session_id,
+                &op_id,
+                file_ops::EVENT_VERIFY_FAILED,
+                serde_json::json!({ "expected": expected, "actual": actual, "backupPath": backup_path }),
+            );
+            managed.failed(
+                "post-write verification failed: content on disk differs from what was written",
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "the file was written but reads back differently; check the target and the backup",
+                    "code": "verify_failed",
+                    "operationId": op_id,
+                    "expectedSha256": expected,
+                    "actualSha256": actual,
+                    "backupPath": backup_path,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            file_ops::record_event(
+                &state.db,
+                session_id,
+                &op_id,
+                file_ops::EVENT_VERIFY_FAILED,
+                serde_json::json!({ "expected": expected, "error": e, "backupPath": backup_path }),
+            );
+            managed.failed(&format!("write sent but could not be verified: {}", e));
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("the write was sent but could not be verified: {}", e),
+                    "code": "verify_failed",
+                    "operationId": op_id,
+                    "backupPath": backup_path,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RestoreFileRequest {
+    path: String,
+    backup_path: String,
+}
+
+/// Put a backup made by a previous write back in place. Itself a verified
+/// write (with its own backup of the current content), so a restore can be
+/// undone too.
+async fn handle_restore_file(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    AuthUser(user_id): AuthUser,
+    Json(req): Json<RestoreFileRequest>,
+) -> impl IntoResponse {
+    if !state.sessions.is_owner(&session_id, &user_id) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Err(e) = ensure_helper(&state, &session_id, &user_id).await {
+        return e.into_response();
+    }
+    for p in [&req.path, &req.backup_path] {
+        if let Err(e) = crate::utils::validate_path(p) {
+            return (StatusCode::BAD_REQUEST, Json(ApiError { error: e })).into_response();
+        }
+    }
+    if !req.backup_path.contains(".ngterm-bak-") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "backupPath is not a backup made by this platform".into(),
+            }),
+        )
+            .into_response();
+    }
+    let data = match state.helpers.sftp_read(&session_id, &req.backup_path).await {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: format!("backup not readable: {}", e),
+                }),
+            )
+                .into_response()
+        }
+    };
+    let baseline = match file_ops::read_baseline(&state, &session_id, &req.path).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError { error: e }),
+            )
+                .into_response()
+        }
+    };
+    let summary = format!(
+        "restore {} from {} ({} bytes; baseline {})",
+        req.path,
+        req.backup_path,
+        data.len(),
+        baseline.short_binding()
+    );
+    let exists = baseline.exists;
+    verified_write(
+        &state,
+        &session_id,
+        &user_id,
+        &req.path,
+        &data,
+        summary,
+        baseline,
+        exists,
+    )
+    .await
 }
 
 async fn handle_delete_file(

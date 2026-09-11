@@ -1,3 +1,4 @@
+import type { ChangePreview } from '@/utils/changes'
 import { ref } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 
@@ -24,6 +25,8 @@ export interface PermissionRequest {
   target?: string
   /** Set when policy routes this call to a second person instead of the requester. */
   secondPerson?: SecondPersonApproval
+  /** Server-computed diff/baseline for a file write, when available. */
+  preview?: ChangePreview
 }
 
 export interface SecondPersonApproval {
@@ -63,6 +66,9 @@ export function useAgentSocket(agentId: string) {
   function pushSystem(content: string) {
     messages.value.push({ role: 'system', content, timestamp: Date.now() })
   }
+
+  // Previews can arrive before or after the permission request they belong to.
+  const previews = new Map<string, ChangePreview>()
 
   let ws: WebSocket | null = null
   let didOpen = false
@@ -191,14 +197,17 @@ export function useAgentSocket(agentId: string) {
       status.value = 'waiting_approval'
       const toolInfo = data.tool as Record<string, unknown> | undefined
       const riskData = data.risk as Record<string, unknown> | undefined
+      const reqId = (data.id as string) || (data.request_id as string) || ''
       pendingApproval.value = {
         toolName: (toolInfo?.name as string) || (data.tool as string) || 'unknown',
         input: (toolInfo?.input as Record<string, unknown>) || (data.input as Record<string, unknown>) || {},
-        requestId: (data.id as string) || (data.request_id as string) || '',
+        requestId: reqId,
         description: (data.description as string) || '',
         risk: riskData ? { level: riskData.level as RiskInfo['level'], reason: riskData.reason as string } : undefined,
-        target: (data.target as string) || undefined
+        target: (data.target as string) || undefined,
+        preview: previews.get(reqId)
       }
+      previews.delete(reqId)
     } else if (type === 'ask_user') {
       status.value = 'waiting_input'
       const opts = data.options
@@ -250,6 +259,25 @@ export function useAgentSocket(agentId: string) {
       pushSystem(comment ? `${text}: ${comment}` : text)
       if (pendingApproval.value?.requestId === (data.id as string)) pendingApproval.value = null
       status.value = approved ? 'tool_use' : 'thinking'
+    } else if (type === 'change_preview') {
+      const id = data.id as string
+      const { type: _t, id: _i, ...rest } = data
+      const preview = rest as unknown as ChangePreview
+      if (pendingApproval.value && pendingApproval.value.requestId === id) {
+        pendingApproval.value = { ...pendingApproval.value, preview }
+      } else {
+        previews.set(id, preview)
+      }
+    } else if (type === 'change_verified') {
+      const path = data.path as string
+      const backup = data.backupPath as string | undefined
+      if (data.verified === true) {
+        pushSystem(`已写入并回读校验 ${path}${backup ? `，备份: ${backup}` : ''}`)
+      } else {
+        pushSystem(
+          `写入 ${path} 后校验失败: ${(data.error as string) || '内容与预期不一致'}${backup ? `。备份: ${backup}` : ''}`
+        )
+      }
     } else if (type === 'approval_failed') {
       pushSystem(`审批申请未能记录，操作被拒绝: ${(data.error as string) || ''}`)
       if (pendingApproval.value?.requestId === (data.id as string)) pendingApproval.value = null

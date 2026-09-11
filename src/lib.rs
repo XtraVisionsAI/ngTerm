@@ -12,6 +12,7 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod extractors;
+pub mod file_ops;
 pub mod guard;
 pub mod helper_pool;
 pub mod key_manager;

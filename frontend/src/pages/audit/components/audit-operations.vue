@@ -12,6 +12,7 @@
     NEmpty,
     NInput,
     NPagination,
+    NPopconfirm,
     NSelect,
     NSpace,
     NTag,
@@ -143,6 +144,38 @@
 
   async function openDetailById(operationId: string) {
     await openDetail({ operationId } as OperationRecord)
+  }
+
+  // --- File change evidence (baseline / backup / verification) ---
+  const fileEventLabel: Record<string, string> = {
+    'file.baseline': '写入前基线',
+    'file.backup': '已备份',
+    'file.verified': '回读校验通过',
+    'file.verify_failed': '回读校验失败'
+  }
+  const restoring = ref(false)
+  async function restoreBackup(backupPath: string) {
+    const op = detail.value?.operation
+    if (!op?.sessionId) return
+    const path = (detail.value?.events.find((e) => e.eventType === 'file.baseline')?.payload.path as string) || ''
+    if (!path) return message.error('该记录没有目标路径')
+    restoring.value = true
+    try {
+      const r = await api.post<{ operationId: string; verified: boolean; backupPath?: string }>(
+        `/sessions/${op.sessionId}/files/restore`,
+        { path, backupPath }
+      )
+      message.success(`已恢复并校验（操作 ${r.operationId.slice(0, 8)}）`)
+      load()
+    } catch (e) {
+      message.error(`恢复失败: ${(e as Error).message}（会话可能已关闭，可在该服务器的新会话中手动恢复）`)
+    } finally {
+      restoring.value = false
+    }
+  }
+  function shortHash(v: unknown): string {
+    const s = typeof v === 'string' ? v : ''
+    return s.length > 12 ? `${s.slice(0, 12)}…` : s
   }
 
   function configChange(ev: AuditEvent): ConfigChangePayload | null {
@@ -344,6 +377,50 @@
           <div v-for="ev in detail.events.filter((e) => !configChange(e))" :key="ev.eventId" class="mb-1 text-xs">
             <span class="opacity-60">{{ formatTime(ev.occurredAt) }}</span>
             <span class="ml-2 font-mono">{{ ev.eventType }}</span>
+            <template v-if="fileEventLabel[ev.eventType]">
+              <span class="ml-2" :class="ev.eventType === 'file.verify_failed' ? 'text-om-error' : 'opacity-80'">
+                {{ fileEventLabel[ev.eventType] }}
+              </span>
+              <div class="ml-4 mt-0.5 opacity-80">
+                <template v-if="ev.eventType === 'file.baseline'">
+                  <span class="font-mono">{{ ev.payload.path }}</span>
+                  <span class="ml-2">{{
+                    ev.payload.exists
+                      ? `已存在 · ${ev.payload.size} 字节 · sha256 ${shortHash(ev.payload.sha256)}`
+                      : '新文件'
+                  }}</span>
+                  <span v-if="ev.payload.tooLarge" class="ml-2 text-om-warning">文件过大，未绑定基线</span>
+                </template>
+                <template v-else-if="ev.eventType === 'file.backup'">
+                  <span class="font-mono">{{ ev.payload.backupPath }}</span>
+                  <n-popconfirm
+                    v-if="detail.operation.sessionId"
+                    @positive-click="restoreBackup(ev.payload.backupPath as string)"
+                  >
+                    <template #trigger>
+                      <n-button size="tiny" quaternary type="warning" class="ml-2" :loading="restoring"
+                        >恢复此备份</n-button
+                      >
+                    </template>
+                    将用该备份覆盖当前文件（当前内容会再次备份并回读校验）。继续？
+                  </n-popconfirm>
+                </template>
+                <template v-else-if="ev.eventType === 'file.verified'">
+                  sha256 <span class="font-mono">{{ shortHash(ev.payload.sha256) }}</span>
+                </template>
+                <template v-else>
+                  <span v-if="ev.payload.actual">
+                    期望 <span class="font-mono">{{ shortHash(ev.payload.expected) }}</span
+                    >，实际
+                    <span class="font-mono">{{ shortHash(ev.payload.actual) }}</span>
+                  </span>
+                  <span v-else>{{ ev.payload.error }}</span>
+                  <span v-if="ev.payload.backupPath" class="ml-2"
+                    >备份: <span class="font-mono">{{ ev.payload.backupPath }}</span></span
+                  >
+                </template>
+              </div>
+            </template>
             <template v-if="ev.eventType === 'command.output'">
               <span class="ml-2 opacity-60">
                 exit {{ ev.payload.exitCode }} · {{ ev.payload.durationMs }} ms

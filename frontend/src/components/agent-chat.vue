@@ -13,6 +13,7 @@
     useMessage
   } from 'naive-ui'
   import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+  import ChangePreview from '@/components/change-preview.vue'
   import ServerToolConfigForm from '@/components/server-tool-config-form.vue'
   import ToolConfigForm from '@/components/tool-config-form.vue'
   import { useAgentSocket } from '@/composables/useAgentSocket'
@@ -710,8 +711,16 @@
             <div v-if="pendingApproval.description" class="mb-2 text-xs text-om-text">
               {{ pendingApproval.description }}
             </div>
+            <change-preview v-if="pendingApproval.preview" :preview="pendingApproval.preview" compact class="mb-2" />
+            <n-collapse v-if="pendingApproval.preview && Object.keys(pendingApproval.input).length > 0" class="mb-2">
+              <n-collapse-item title="原始参数" name="raw">
+                <pre
+                  class="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-om-bg p-2 text-xs text-om-success font-mono"
+                  >{{ JSON.stringify(pendingApproval.input, null, 2) }}</pre>
+              </n-collapse-item>
+            </n-collapse>
             <pre
-              v-if="Object.keys(pendingApproval.input).length > 0"
+              v-else-if="Object.keys(pendingApproval.input).length > 0"
               class="mb-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-om-bg p-2 text-xs text-om-success font-mono"
               >{{ JSON.stringify(pendingApproval.input, null, 2) }}</pre>
             <div v-if="pendingApproval.secondPerson" class="flex flex-wrap items-center gap-2 text-xs">

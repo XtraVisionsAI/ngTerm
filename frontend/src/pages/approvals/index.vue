@@ -22,6 +22,7 @@
   import { useApi } from '@/composables/useApi'
   import { useAuthStore } from '@/stores/auth'
   import { approvalKindLabel, approvalStatusInfo, riskLevelLabel, secondsUntil } from '@/utils/approvals'
+  import { isChangePreview } from '@/utils/changes'
   import { formatTime } from '@/utils/format'
 
   const api = useApi()
@@ -146,7 +147,15 @@
     }
   }
 
-  const snapshotText = computed(() => (detail.value ? JSON.stringify(detail.value.snapshot, null, 2) : ''))
+  const snapshotText = computed(() => {
+    if (!detail.value) return ''
+    const { preview: _p, ...rest } = detail.value.snapshot
+    return JSON.stringify(rest, null, 2)
+  })
+  const changePreview = computed(() => {
+    const p = detail.value?.snapshot?.preview
+    return isChangePreview(p) ? p : null
+  })
 
   function remaining(r: ApprovalRequest): string {
     if (r.status !== 'pending') return '-'
@@ -304,6 +313,10 @@
           </n-descriptions-item>
         </n-descriptions>
 
+        <template v-if="changePreview">
+          <div class="mb-1 mt-3 text-xs text-om-dimmed">变更预览（基线哈希已绑定；执行时文件若已变化则审批失效）</div>
+          <change-preview :preview="changePreview" class="border border-om-border rounded p-2" />
+        </template>
         <div class="mb-1 mt-3 text-xs text-om-dimmed">冻结快照（执行时必须与此一致）</div>
         <pre class="max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-om-bg p-2 text-xs font-mono">{{
           snapshotText
