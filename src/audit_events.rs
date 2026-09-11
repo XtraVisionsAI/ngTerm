@@ -906,7 +906,7 @@ fn append_event_unmetered(db: &Database, ev: NewEvent<'_>) -> Result<AuditEvent,
     })
 }
 
-pub(crate) fn redact_json(v: serde_json::Value) -> serde_json::Value {
+pub fn redact_json(v: serde_json::Value) -> serde_json::Value {
     match v {
         serde_json::Value::String(s) => serde_json::Value::String(redact(&s)),
         serde_json::Value::Array(a) => {
