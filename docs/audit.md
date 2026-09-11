@@ -181,5 +181,28 @@ operations still `running` after 15 minutes are reported as stale so a
 handler that died without reporting is visible. Counters reset on restart;
 the audit store is the durable record.
 
+## Pre-execution check hook
+
+Before the platform opens a session on a user's behalf or starts a managed
+operation through its own channel (file, git, upload, agent launch), it asks
+an installed `ExecutionGuard` (`src/guard.rs`) whether to proceed. The guard
+sees only server-held facts: the authenticated user id and admin flag, and
+either `SessionAdmission {server_id, remote_user}` or `Operation {intent}`
+with the same `OperationIntent` that is written to the audit store. It answers
+`Proceed`, `Refuse {reason}` (HTTP 403) or `AwaitApproval {request_id,
+message}` (HTTP 202 with `{"decision": "await_approval", "approvalRequired":
+true, "requestId": ...}`; the client repeats the same request once whatever
+process the distribution runs has approved it).
+
+The open-source build installs no guard and everything proceeds as before.
+Distributions install one with `AppState::install_guard`, add their own
+routes under `/api` through `RouterHooks::extra_api`, and list what they
+provide in `RouterHooks::features`, served by the unauthenticated
+`GET /api/features` so the shared frontend can show the matching screens.
+Nothing a client, a model or a tool result says can enter the decision
+except through the recorded intent. Refused and blocked actions never start,
+so they leave no `running` operation behind; a denied managed operation is
+recorded with status `denied` and the reason.
+
 ## Planned, not yet implemented
 

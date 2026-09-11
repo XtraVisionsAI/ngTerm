@@ -61,6 +61,8 @@ The crate builds as both a lib (`ngterm`) and a binary. Downstream distributions
 - `web::resolve_agent_launch()` / `web::start_agent_inner()` — shared agent launch plumbing
 - `AgentBridge::register_embedded()` — register an in-process agent session driven by an external engine
 - `Database::seed_tool_if_missing()` — register bundled tool definitions
+- `guard::ExecutionGuard` + `AppState::install_guard()` — neutral pre-execution check (session admission, managed operations); answers proceed / refuse / await approval
+- `RouterHooks::extra_api` / `RouterHooks::features` — extra `/api` routes and `GET /api/features` for the shared frontend
 
 ### Key Crypto Flow
 
