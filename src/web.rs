@@ -56,6 +56,11 @@ fn err(status: StatusCode, msg: &str) -> impl IntoResponse {
 pub struct RouterHooks {
     /// Replaces the default POST /api/sessions/{id}/agent handler.
     pub start_agent: Option<axum::routing::MethodRouter<Arc<AppState>>>,
+    /// Additional routes merged under `/api` (same state, same layers).
+    pub extra_api: Option<Router<Arc<AppState>>>,
+    /// Feature names the distribution provides, served by `GET /api/features`
+    /// so the shared frontend can enable the matching screens.
+    pub features: Vec<&'static str>,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -63,9 +68,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 }
 
 pub fn build_router_with_hooks(state: Arc<AppState>, hooks: RouterHooks) -> Router {
+    let features = Arc::new(hooks.features.clone());
     let api = Router::new()
         // Liveness/readiness for load balancers and orchestrators.
         .route("/health", get(handle_health))
+        .route(
+            "/features",
+            get(move || {
+                let features = features.clone();
+                async move { Json(serde_json::json!({ "features": *features })) }
+            }),
+        )
         // Auth
         .route("/auth/login", post(handle_login))
         .route("/auth/admin-login", post(handle_admin_login))
@@ -173,6 +186,10 @@ pub fn build_router_with_hooks(state: Arc<AppState>, hooks: RouterHooks) -> Rout
         .route("/ui-state", get(handle_get_ui_state))
         .route("/ui-state", put(handle_save_ui_state));
 
+    let api = match hooks.extra_api {
+        Some(extra) => api.merge(extra),
+        None => api,
+    };
     let router = Router::new()
         .nest("/api", api)
         .route("/ws/terminal/{session_id}", get(ws_handler::ws_terminal))
@@ -1166,6 +1183,25 @@ async fn handle_create_session(
         }
     };
 
+    // Pre-execution check: the installed guard may require a second person
+    // to admit this user to this server before anything is connected.
+    match crate::guard::check(
+        state.guard(),
+        crate::guard::GuardRequest {
+            user_id: &user_id,
+            is_admin: false,
+            action: crate::guard::GuardAction::SessionAdmission {
+                server_id: &server.id,
+                remote_user: &server.username,
+            },
+        },
+    )
+    .await
+    {
+        crate::guard::GuardDecision::Proceed => {}
+        other => return guard_response(other),
+    }
+
     let cols = req
         .cols
         .unwrap_or(state.config.default_cols as u32)
@@ -1413,8 +1449,36 @@ fn config_error_response(e: OpError, status: StatusCode) -> axum::response::Resp
     }
 }
 
+/// Answer for a guard decision other than `Proceed`: 403 with the reason,
+/// or 202 with the approval request the caller has to wait for.
+pub fn guard_response(decision: crate::guard::GuardDecision) -> axum::response::Response {
+    use crate::guard::GuardDecision;
+    match decision {
+        GuardDecision::Proceed => StatusCode::NO_CONTENT.into_response(),
+        GuardDecision::Refuse { reason } => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": reason, "decision": "refuse" })),
+        )
+            .into_response(),
+        GuardDecision::AwaitApproval {
+            request_id,
+            message,
+        } => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "error": message,
+                "decision": "await_approval",
+                "approvalRequired": true,
+                "requestId": request_id,
+            })),
+        )
+            .into_response(),
+    }
+}
+
 fn op_error_response(e: OpError) -> axum::response::Response {
     match e {
+        OpError::Blocked(decision) => guard_response(decision),
         OpError::AuditRefused(msg) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiError { error: msg }),
@@ -1926,16 +1990,18 @@ async fn handle_upload_file(
         let file_name = field.file_name().unwrap_or("unnamed").to_string();
         let remote_path = format!("{}/{}", upload_dir.trim_end_matches('/'), file_name);
 
-        let managed = match audit_ops::begin(
+        let managed = match audit_ops::run_begin(
             &state,
             &session_id,
             &user_id,
             OperationKind::Upload,
             format!("upload {}", remote_path),
             None,
-        ) {
+        )
+        .await
+        {
             Ok(m) => m,
-            Err(e) => return op_error_response(OpError::AuditRefused(e)),
+            Err(e) => return op_error_response(e),
         };
         let mut file = match state.helpers.open_write(&session_id, &remote_path).await {
             Ok(f) => f,

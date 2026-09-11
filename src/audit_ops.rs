@@ -12,6 +12,7 @@ use crate::audit_events::{
     OperationStatus, Source, Target,
 };
 use crate::db::Database;
+use crate::guard::{self, GuardAction, GuardDecision, GuardRequest};
 use crate::AppState;
 
 /// A registered, running operation. Must be finished explicitly; dropping it
@@ -129,35 +130,23 @@ pub fn begin(
     summary: String,
     cwd: Option<String>,
 ) -> Result<ManagedOp, String> {
-    let session = audit_events::get_session(&state.db, session_id)
-        .ok()
-        .flatten();
-    let actor = Actor {
-        kind: Some(ActorKind::Human),
-        user_id: Some(user_id.to_string()),
-        username: session.as_ref().and_then(|s| s.actor.username.clone()),
-        remote_addr: session.as_ref().and_then(|s| s.actor.remote_addr.clone()),
-        ..Default::default()
-    };
-    let target = session
-        .as_ref()
-        .map(|s| s.target.clone())
-        .unwrap_or_else(|| Target {
-            server_id: state.sessions.get_server_id(session_id),
-            ..Default::default()
-        });
-    let intent = OperationIntent {
-        session_id: Some(session_id.to_string()),
-        task_id: None,
-        parent_operation_id: None,
-        actor,
-        source: Source::Api,
-        kind,
-        summary,
-        target,
-        cwd,
-    };
+    let intent = intent_for(state, session_id, user_id, kind, summary, cwd);
     begin_intent(state, &intent)
+}
+
+/// Guarded [`begin`]: the guard decides first, then the intent is recorded
+/// and the caller executes and reports through the returned [`ManagedOp`].
+pub async fn run_begin(
+    state: &AppState,
+    session_id: &str,
+    user_id: &str,
+    kind: OperationKind,
+    summary: String,
+    cwd: Option<String>,
+) -> Result<ManagedOp, OpError> {
+    let intent = intent_for(state, session_id, user_id, kind, summary, cwd);
+    preflight(state, user_id, &intent).await?;
+    begin_intent(state, &intent).map_err(OpError::AuditRefused)
 }
 
 /// Register and start an arbitrary intent. Fails when the record cannot be
@@ -182,9 +171,71 @@ pub fn begin_intent(state: &AppState, intent: &OperationIntent) -> Result<Manage
     })
 }
 
-/// Run `op` as a managed operation: intent first, then the future, then the
-/// truthful outcome. The returned error is either the audit refusal or the
-/// operation's own error, distinguishable by [`AuditRefused`].
+/// Build the intent `begin` would record, so the guard judges exactly what
+/// will be written.
+fn intent_for(
+    state: &AppState,
+    session_id: &str,
+    user_id: &str,
+    kind: OperationKind,
+    summary: String,
+    cwd: Option<String>,
+) -> OperationIntent {
+    let session = audit_events::get_session(&state.db, session_id)
+        .ok()
+        .flatten();
+    let actor = Actor {
+        kind: Some(ActorKind::Human),
+        user_id: Some(user_id.to_string()),
+        username: session.as_ref().and_then(|s| s.actor.username.clone()),
+        remote_addr: session.as_ref().and_then(|s| s.actor.remote_addr.clone()),
+        ..Default::default()
+    };
+    let target = session
+        .as_ref()
+        .map(|s| s.target.clone())
+        .unwrap_or_else(|| Target {
+            server_id: state.sessions.get_server_id(session_id),
+            ..Default::default()
+        });
+    OperationIntent {
+        session_id: Some(session_id.to_string()),
+        task_id: None,
+        parent_operation_id: None,
+        actor,
+        source: Source::Api,
+        kind,
+        summary,
+        target,
+        cwd,
+    }
+}
+
+/// Ask the installed guard about `intent` on behalf of `user_id`. `Ok` means
+/// proceed; the error carries the decision for the HTTP answer.
+pub async fn preflight(
+    state: &AppState,
+    user_id: &str,
+    intent: &OperationIntent,
+) -> Result<(), OpError> {
+    let decision = guard::check(
+        state.guard(),
+        GuardRequest {
+            user_id,
+            is_admin: user_id == "admin",
+            action: GuardAction::Operation { intent },
+        },
+    )
+    .await;
+    match decision {
+        GuardDecision::Proceed => Ok(()),
+        other => Err(OpError::Blocked(other)),
+    }
+}
+
+/// Run `op` as a managed operation: guard check, intent, the future, then
+/// the truthful outcome. The returned error is the guard's decision, the
+/// audit refusal or the operation's own error.
 pub async fn run<T, F>(
     state: &AppState,
     session_id: &str,
@@ -197,8 +248,9 @@ pub async fn run<T, F>(
 where
     F: Future<Output = Result<T, String>>,
 {
-    let managed =
-        begin(state, session_id, user_id, kind, summary, cwd).map_err(OpError::AuditRefused)?;
+    let intent = intent_for(state, session_id, user_id, kind, summary, cwd);
+    preflight(state, user_id, &intent).await?;
+    let managed = begin_intent(state, &intent).map_err(OpError::AuditRefused)?;
     match op.await {
         Ok(v) => {
             managed.succeeded();
@@ -213,6 +265,8 @@ where
 
 #[derive(Debug)]
 pub enum OpError {
+    /// The guard refused or deferred the operation; nothing was executed.
+    Blocked(GuardDecision),
     /// The intent could not be recorded; nothing was executed.
     AuditRefused(String),
     /// The operation ran and reported this error.
@@ -343,6 +397,84 @@ mod tests {
         };
         let (state, _rx) = crate::build_app_state(config, db).await;
         state
+    }
+
+    #[tokio::test]
+    async fn the_guard_decides_before_anything_is_recorded_or_run() {
+        let state = test_state().await;
+        state
+            .install_guard(std::sync::Arc::new(
+                crate::guard::test_support::KeywordGuard {
+                    needle: "approve-me",
+                },
+            ))
+            .unwrap();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mark = |r: &std::sync::Arc<std::sync::atomic::AtomicBool>| {
+            let r = r.clone();
+            async move {
+                r.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<(), String>(())
+            }
+        };
+
+        let deferred = run(
+            &state,
+            "g1",
+            "u1",
+            OperationKind::FileWrite,
+            "write approve-me.conf".into(),
+            None,
+            mark(&ran),
+        )
+        .await;
+        assert!(
+            matches!(deferred, Err(OpError::Blocked(GuardDecision::AwaitApproval { ref request_id, .. })) if request_id == "req-1")
+        );
+        let refused = run(
+            &state,
+            "g1",
+            "u1",
+            OperationKind::FileDelete,
+            "deny this".into(),
+            None,
+            mark(&ran),
+        )
+        .await;
+        assert!(matches!(
+            refused,
+            Err(OpError::Blocked(GuardDecision::Refuse { .. }))
+        ));
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        let (_, total) = audit_events::list_operations(
+            &state.db,
+            &audit_events::OperationFilter {
+                session_id: Some("g1".into()),
+                ..Default::default()
+            },
+            10,
+            0,
+        )
+        .unwrap();
+        assert_eq!(total, 0, "blocked operations leave no operation row");
+
+        let ok = run(
+            &state,
+            "g1",
+            "u1",
+            OperationKind::FileRead,
+            "read plain".into(),
+            None,
+            mark(&ran),
+        )
+        .await;
+        assert!(ok.is_ok());
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(state
+            .install_guard(std::sync::Arc::new(
+                crate::guard::test_support::KeywordGuard { needle: "x" }
+            ))
+            .is_err());
     }
 
     #[tokio::test]

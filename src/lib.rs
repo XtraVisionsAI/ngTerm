@@ -12,6 +12,7 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod extractors;
+pub mod guard;
 pub mod helper_pool;
 pub mod key_manager;
 pub mod local_pty;
@@ -45,6 +46,23 @@ pub struct AppState {
     pub admin_terminal_lock: tokio::sync::Mutex<()>,
     /// What this process had to recover at start (exposed via /api/health).
     pub startup: audit_system::StartupReport,
+    /// Pre-execution check installed by the distribution (none in the
+    /// open-source build). Set once with [`AppState::install_guard`].
+    guard: std::sync::OnceLock<Arc<dyn guard::ExecutionGuard>>,
+}
+
+impl AppState {
+    /// Install the pre-execution guard. Returns `Err` if one is already set:
+    /// a guard must not be swapped while the server is serving.
+    pub fn install_guard(&self, guard: Arc<dyn guard::ExecutionGuard>) -> Result<(), String> {
+        self.guard
+            .set(guard)
+            .map_err(|_| "an execution guard is already installed".to_string())
+    }
+
+    pub fn guard(&self) -> Option<&Arc<dyn guard::ExecutionGuard>> {
+        self.guard.get()
+    }
 }
 
 pub async fn build_app_state(
@@ -140,6 +158,7 @@ pub async fn build_app_state(
         recordings,
         admin_terminal_lock: tokio::sync::Mutex::new(()),
         startup,
+        guard: std::sync::OnceLock::new(),
     });
 
     (state, session_ended_rx)
