@@ -1,7 +1,9 @@
 <script setup lang="ts">
-  import { computed } from 'vue'
+  import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
   import { useRoute, useRouter } from 'vue-router'
+  import { useApi } from '@/composables/useApi'
   import { useAuthStore } from '@/stores/auth'
+  import { useFeaturesStore } from '@/stores/features'
 
   const activeKey = defineModel<string>('activePanel')
 
@@ -15,6 +17,9 @@
 
   const auth = useAuthStore()
   const router = useRouter()
+  const features = useFeaturesStore()
+  const api = useApi()
+  const route = useRoute()
 
   interface ActivityItem {
     icon: string
@@ -30,6 +35,8 @@
     { icon: 'i-ri:file-list-3-line', key: '/audit', tooltip: '审计日志' }
   ]
 
+  const approvalsItem: ActivityItem = { icon: 'i-ri:checkbox-multiple-line', key: '/approvals', tooltip: '审批' }
+
   const adminItems: ActivityItem[] = [
     { icon: 'i-ri:dashboard-line', key: '/admin', tooltip: '面板' },
     { icon: 'i-ri:user-settings-line', key: '/admin/users', tooltip: '用户管理' },
@@ -37,9 +44,49 @@
     { icon: 'i-ri:file-list-3-line', key: '/audit', tooltip: '审计日志' }
   ]
 
-  const items = computed(() => (props.isAdmin ? adminItems : userItems))
+  const items = computed(() => {
+    const base = props.isAdmin ? adminItems : userItems
+    return features.approvals ? [...base, approvalsItem] : base
+  })
 
-  const route = useRoute()
+  // Pending approvals waiting for this person; polled while the feature is on.
+  const inboxCount = ref(0)
+  let inboxTimer: ReturnType<typeof setInterval> | null = null
+
+  async function refreshInbox() {
+    if (!features.approvals || !auth.isAuthenticated) return
+    try {
+      const data = await api.get<{ count: number }>('/approvals/inbox-count')
+      inboxCount.value = data.count
+    } catch {}
+  }
+
+  function startInboxPolling() {
+    if (inboxTimer) return
+    refreshInbox()
+    inboxTimer = setInterval(refreshInbox, 30000)
+  }
+
+  onMounted(async () => {
+    await features.load()
+    if (features.approvals) startInboxPolling()
+  })
+  watch(
+    () => features.approvals,
+    (on) => {
+      if (on) startInboxPolling()
+    }
+  )
+  // Landing on the approvals page means the person just looked at the inbox.
+  watch(
+    () => route.path,
+    (p) => {
+      if (p.startsWith('/approvals')) refreshInbox()
+    }
+  )
+  onBeforeUnmount(() => {
+    if (inboxTimer) clearInterval(inboxTimer)
+  })
 
   function handleClick(item: ActivityItem) {
     if (item.key.startsWith('/')) {
@@ -80,6 +127,9 @@
         @click="handleClick(item)"
       >
         <i :class="item.icon" class="activity-icon" />
+        <span v-if="item.key === '/approvals' && inboxCount > 0" class="activity-badge">
+          {{ inboxCount > 99 ? '99+' : inboxCount }}
+        </span>
       </button>
     </div>
     <div class="activity-bottom">
@@ -147,6 +197,22 @@
     display: inline-block;
     width: 20px;
     height: 20px;
+  }
+
+  .activity-badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 8px;
+    background: var(--om-error, #e5484d);
+    color: #fff;
+    font-size: 10px;
+    line-height: 16px;
+    text-align: center;
+    font-weight: 600;
   }
 
   .activity-bottom {

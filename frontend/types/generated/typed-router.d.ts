@@ -45,6 +45,13 @@ declare module 'vue-router/auto-routes' {
       Record<never, never>,
       | never
     >,
+    '/admin/approvals': RouteRecordInfo<
+      '/admin/approvals',
+      '/admin/approvals',
+      Record<never, never>,
+      Record<never, never>,
+      | never
+    >,
     '/admin/components/ToolFormModal': RouteRecordInfo<
       '/admin/components/ToolFormModal',
       '/admin/components/ToolFormModal',
@@ -69,6 +76,13 @@ declare module 'vue-router/auto-routes' {
     '/admin/users': RouteRecordInfo<
       '/admin/users',
       '/admin/users',
+      Record<never, never>,
+      Record<never, never>,
+      | never
+    >,
+    '/approvals/': RouteRecordInfo<
+      '/approvals/',
+      '/approvals',
       Record<never, never>,
       Record<never, never>,
       | never
@@ -165,6 +179,14 @@ declare module 'vue-router/auto-routes' {
       pathParamNames:
         | never
     }
+    'src/pages/admin/approvals.vue': {
+      routes:
+        | '/admin/approvals'
+      views:
+        | never
+      pathParamNames:
+        | never
+    }
     'src/pages/admin/components/ToolFormModal.vue': {
       routes:
         | '/admin/components/ToolFormModal'
@@ -192,6 +214,14 @@ declare module 'vue-router/auto-routes' {
     'src/pages/admin/users.vue': {
       routes:
         | '/admin/users'
+      views:
+        | never
+      pathParamNames:
+        | never
+    }
+    'src/pages/approvals/index.vue': {
+      routes:
+        | '/approvals/'
       views:
         | never
       pathParamNames:

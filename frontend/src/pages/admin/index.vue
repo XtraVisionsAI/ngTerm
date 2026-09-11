@@ -3,9 +3,11 @@
   import { onActivated, onMounted, ref } from 'vue'
   import { useRouter } from 'vue-router'
   import { useApi } from '@/composables/useApi'
+  import { useFeaturesStore } from '@/stores/features'
 
   const api = useApi()
   const router = useRouter()
+  const features = useFeaturesStore()
 
   const userCount = ref(0)
   const activeSessionCount = ref(0)
@@ -21,7 +23,10 @@
     } catch {}
   }
 
-  onMounted(loadStats)
+  onMounted(() => {
+    loadStats()
+    features.load()
+  })
   onActivated(loadStats)
 </script>
 
@@ -39,6 +44,13 @@
         <n-statistic label="审计日志">
           <template #default>
             <n-button text type="primary">查看</n-button>
+          </template>
+        </n-statistic>
+      </n-card>
+      <n-card v-if="features.approvals" class="w-48 cursor-pointer" hoverable @click="router.push('/admin/approvals')">
+        <n-statistic label="审批配置">
+          <template #default>
+            <n-button text type="primary">策略与审批人</n-button>
           </template>
         </n-statistic>
       </n-card>

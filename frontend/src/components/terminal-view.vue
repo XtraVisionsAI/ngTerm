@@ -3,6 +3,7 @@
   import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
   import { getAppTheme, getStoredThemeId } from '@/composables/terminalThemes'
   import { useApi } from '@/composables/useApi'
+  import { postWithAdmission } from '@/composables/useSessionAdmission'
   import { useTerminal } from '@/composables/useTerminal'
   import { useWebSocket } from '@/composables/useWebSocket'
   import { useAuthStore } from '@/stores/auth'
@@ -175,13 +176,17 @@
       if (props.createSessionFn) {
         session = await props.createSessionFn(cols, rows)
       } else {
-        session = await api.post<{
+        session = await postWithAdmission<{
           id: string
           serverId: string
           serverAlias: string
           serverHost: string
           aiToolId?: string
-        }>('/sessions', { serverId: props.serverId, cols, rows })
+        }>(api, '/sessions', { serverId: props.serverId, cols, rows }, (requestId, msg) => {
+          terminal.value?.write(
+            `\r\n\x1B[93m${msg}\x1B[0m\r\n\x1B[90m审批申请 ${requestId}，批准后将自动连接…\x1B[0m\r\n`
+          )
+        })
         sessionStore.updateTabSession(props.sessionId, session as any)
       }
       realSessionId.value = session.id

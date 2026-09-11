@@ -1,6 +1,17 @@
 <script setup lang="ts">
   import type { AgentStatus, PermissionRequest, UserQuestion } from '@/composables/useAgentSocket'
-  import { NButton, NCheckbox, NCollapse, NCollapseItem, NDropdown, NInput, NSelect, NSpin, NTag } from 'naive-ui'
+  import {
+    NButton,
+    NCheckbox,
+    NCollapse,
+    NCollapseItem,
+    NDropdown,
+    NInput,
+    NSelect,
+    NSpin,
+    NTag,
+    useMessage
+  } from 'naive-ui'
   import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
   import ServerToolConfigForm from '@/components/server-tool-config-form.vue'
   import ToolConfigForm from '@/components/tool-config-form.vue'
@@ -39,6 +50,7 @@
   }>()
 
   const api = useApi()
+  const message = useMessage()
   const sessionStore = useSessionStore()
   const insertToTerminal = inject<(command: string, autoExec: boolean) => void>('insertToTerminal')
   const inputText = ref('')
@@ -291,6 +303,20 @@
 
   function handleApproval(granted: boolean) {
     socket?.respondPermission(granted)
+  }
+
+  const withdrawing = ref(false)
+  async function withdrawApproval() {
+    const id = pendingApproval.value?.secondPerson?.approvalRequestId
+    if (!id) return
+    withdrawing.value = true
+    try {
+      await api.post(`/approvals/${id}/cancel`, { reason: '申请人在对话中撤回' })
+    } catch (e: any) {
+      message.error(e.message)
+    } finally {
+      withdrawing.value = false
+    }
   }
 
   async function stopAgent() {
@@ -688,7 +714,19 @@
               v-if="Object.keys(pendingApproval.input).length > 0"
               class="mb-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-om-bg p-2 text-xs text-om-success font-mono"
               >{{ JSON.stringify(pendingApproval.input, null, 2) }}</pre>
-            <div class="flex gap-2">
+            <div v-if="pendingApproval.secondPerson" class="flex flex-wrap items-center gap-2 text-xs">
+              <i class="i-ri:loader-4-line animate-spin" style="display: inline-block; width: 14px; height: 14px" />
+              <span>策略要求第二人审批，等待审批人处理…</span>
+              <span class="text-om-dimmed">申请 {{ pendingApproval.secondPerson.approvalRequestId.slice(0, 8) }}</span>
+              <router-link
+                class="text-om-primary"
+                :to="{ path: '/approvals', query: { request: pendingApproval.secondPerson.approvalRequestId } }"
+              >
+                查看
+              </router-link>
+              <n-button size="tiny" class="ml-auto" :loading="withdrawing" @click="withdrawApproval">撤回申请</n-button>
+            </div>
+            <div v-else class="flex gap-2">
               <n-button size="small" type="success" @click="handleApproval(true)">允许</n-button>
               <n-button size="small" type="error" @click="handleApproval(false)">拒绝</n-button>
             </div>

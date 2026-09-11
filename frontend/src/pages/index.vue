@@ -1,7 +1,7 @@
 <script setup lang="ts">
   import type { PaneContext } from '@/composables/usePaneTree'
   import type { SessionTab } from '@/stores/session'
-  import { NBadge, NButton, NDropdown, NEmpty, NSpace, NTabPane, NTabs, NTooltip } from 'naive-ui'
+  import { NBadge, NButton, NDropdown, NEmpty, NSpace, NTabPane, NTabs, NTooltip, useMessage } from 'naive-ui'
   import { computed, onMounted, onUnmounted, provide, ref, watch } from 'vue'
   import AgentChat from '@/components/agent-chat.vue'
   import { FileExplorer } from '@/components/file-explorer'
@@ -17,12 +17,18 @@
     splitPane as splitPaneFn,
     updatePaneNodeId
   } from '@/composables/usePaneTree'
+  import { postWithAdmission } from '@/composables/useSessionAdmission'
   import { useTerminalTheme } from '@/composables/useTerminalTheme'
   import { useUiState } from '@/composables/useUiState'
   import { useSessionStore } from '@/stores/session'
 
   const sessionStore = useSessionStore()
   const api = useApi()
+  const message = useMessage()
+
+  function onAdmissionWait(requestId: string, msg: string) {
+    message.info(`${msg}（申请 ${requestId.slice(0, 8)}），批准后自动连接`, { duration: 8000 })
+  }
   const uiState = useUiState()
 
   const { currentThemeKey, themeOptions, handleThemeSelect } = useTerminalTheme()
@@ -48,7 +54,12 @@
         break
       }
     }
-    const session = await api.post<SessionTab>('/sessions', { serverId, cols, rows, parentSessionId })
+    const session = await postWithAdmission<SessionTab>(
+      api,
+      '/sessions',
+      { serverId, cols, rows, parentSessionId },
+      onAdmissionWait
+    )
     for (const tab of sessionStore.tabs) {
       if (tab.paneTree && updatePaneNodeId(tab.paneTree, pendingId, session.id)) {
         if (tab.activePaneId === pendingId) tab.activePaneId = session.id
@@ -81,12 +92,17 @@
       }
     }
     if (!serverId) throw new Error('找不到对应的服务器')
-    const session = await api.post<SessionTab>('/sessions', {
-      serverId,
-      cols,
-      rows,
-      parentSessionId: parentTabId !== oldSessionId ? parentTabId : undefined
-    })
+    const session = await postWithAdmission<SessionTab>(
+      api,
+      '/sessions',
+      {
+        serverId,
+        cols,
+        rows,
+        parentSessionId: parentTabId !== oldSessionId ? parentTabId : undefined
+      },
+      onAdmissionWait
+    )
     for (const tab of sessionStore.tabs) {
       if (tab.paneTree && updatePaneNodeId(tab.paneTree, oldSessionId, session.id)) {
         if (tab.activePaneId === oldSessionId) tab.activePaneId = session.id

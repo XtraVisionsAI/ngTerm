@@ -34,7 +34,7 @@ router.beforeEach(async (to) => {
     return { path: authStore.isAdmin ? '/admin' : '/' }
   }
   if (authStore.isAuthenticated && authStore.isAdmin) {
-    const adminAllowed = ['/admin', '/audit']
+    const adminAllowed = ['/admin', '/audit', '/approvals']
     if (!adminAllowed.some((p) => to.path.startsWith(p))) {
       return { path: '/admin' }
     }

@@ -22,6 +22,16 @@ export interface PermissionRequest {
   description: string
   risk?: RiskInfo
   target?: string
+  /** Set when policy routes this call to a second person instead of the requester. */
+  secondPerson?: SecondPersonApproval
+}
+
+export interface SecondPersonApproval {
+  approvalRequestId: string
+  expiresAt: string
+  summary: string
+  riskLevel?: string
+  policyVersion?: string
 }
 
 export interface RiskInfo {
@@ -199,9 +209,51 @@ export function useAgentSocket(agentId: string) {
       }
     } else if (type === 'permission_ack') {
       const ackStatus = data.status as string | undefined
-      if (ackStatus && ackStatus !== 'applied') {
+      if (ackStatus === 'second_person_required') {
+        pushSystem('此操作需要第二人审批，你的选择不会生效，请等待审批人处理')
+      } else if (ackStatus && ackStatus !== 'applied') {
         pushSystem(`审批未生效 (${ackStatus})，请重试或等待新的审批请求`)
       }
+    } else if (type === 'approval_pending') {
+      // The gate took this call over: the requester waits, an approver decides.
+      const callId = data.id as string
+      const info: SecondPersonApproval = {
+        approvalRequestId: (data.requestId as string) || '',
+        expiresAt: (data.expiresAt as string) || '',
+        summary: (data.summary as string) || '',
+        riskLevel: (data.riskLevel as string) || undefined,
+        policyVersion: (data.policyVersion as string) || undefined
+      }
+      if (pendingApproval.value && pendingApproval.value.requestId === callId) {
+        pendingApproval.value = { ...pendingApproval.value, secondPerson: info }
+      } else {
+        pendingApproval.value = {
+          toolName: 'unknown',
+          input: {},
+          requestId: callId,
+          description: info.summary,
+          secondPerson: info
+        }
+      }
+      status.value = 'waiting_approval'
+    } else if (type === 'approval_decided') {
+      const approved = data.approved === true
+      const outcome = data.status as string | undefined
+      const by = data.decidedBy as string | undefined
+      const comment = data.comment as string | undefined
+      let text: string
+      if (approved) text = `第二人审批已批准${by ? `（${by}）` : ''}`
+      else if (outcome === 'rejected') text = `第二人审批已拒绝${by ? `（${by}）` : ''}`
+      else if (outcome === 'expired') text = '审批申请已过期，操作被拒绝'
+      else if (outcome === 'cancelled') text = '审批申请已撤回，操作被拒绝'
+      else text = `审批未通过（${outcome || 'unknown'}），操作被拒绝`
+      pushSystem(comment ? `${text}: ${comment}` : text)
+      if (pendingApproval.value?.requestId === (data.id as string)) pendingApproval.value = null
+      status.value = approved ? 'tool_use' : 'thinking'
+    } else if (type === 'approval_failed') {
+      pushSystem(`审批申请未能记录，操作被拒绝: ${(data.error as string) || ''}`)
+      if (pendingApproval.value?.requestId === (data.id as string)) pendingApproval.value = null
+      status.value = 'thinking'
     } else if (type === 'gap') {
       const dropped = (data.dropped as number | undefined) ?? 0
       pushSystem(`输出过快，已丢弃 ${dropped} 条事件；以上内容可能不完整`)
