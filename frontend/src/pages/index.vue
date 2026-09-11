@@ -4,6 +4,7 @@
   import { NBadge, NButton, NDropdown, NEmpty, NSpace, NTabPane, NTabs, NTooltip, useMessage } from 'naive-ui'
   import { computed, onMounted, onUnmounted, provide, ref, watch } from 'vue'
   import AgentChat from '@/components/agent-chat.vue'
+  import ControlledCommandPanel from '@/components/controlled-command-panel.vue'
   import { FileExplorer } from '@/components/file-explorer'
   import GitPanel from '@/components/git-panel.vue'
   import ResizeHandle from '@/components/layout/ResizeHandle.vue'
@@ -20,6 +21,7 @@
   import { postWithAdmission } from '@/composables/useSessionAdmission'
   import { useTerminalTheme } from '@/composables/useTerminalTheme'
   import { useUiState } from '@/composables/useUiState'
+  import { useFeaturesStore } from '@/stores/features'
   import { useSessionStore } from '@/stores/session'
 
   const sessionStore = useSessionStore()
@@ -120,6 +122,9 @@
 
   const showFiles = ref(false)
   const showGit = ref(false)
+  const showControlled = ref(false)
+  const features = useFeaturesStore()
+  features.load()
   const showAgent = ref(false)
   const sidePanelWidth = ref(320)
   const agentPanelWidth = ref(400)
@@ -128,6 +133,7 @@
   const sidePanel = computed(() => {
     if (showFiles.value) return 'files'
     if (showGit.value) return 'git'
+    if (showControlled.value && features.has('controlled-commands')) return 'controlled'
     return null
   })
 
@@ -167,6 +173,7 @@
       if (savedState.layout) {
         showFiles.value = savedState.layout.showFiles ?? false
         showGit.value = savedState.layout.showGit ?? false
+        showControlled.value = savedState.layout.showControlled ?? false
         showAgent.value = savedState.layout.showAgent ?? false
         sidePanelWidth.value = savedState.layout.sidePanelWidth ?? 320
         agentPanelWidth.value = savedState.layout.agentPanelWidth ?? 400
@@ -192,11 +199,12 @@
     document.removeEventListener('keydown', handleKeydown)
   })
 
-  watch([showFiles, showGit, showAgent, sidePanelWidth, agentPanelWidth], () => {
+  watch([showFiles, showGit, showControlled, showAgent, sidePanelWidth, agentPanelWidth], () => {
     if (!restored.value) return
     uiState.updateLayout({
       showFiles: showFiles.value,
       showGit: showGit.value,
+      showControlled: showControlled.value,
       showAgent: showAgent.value,
       sidePanelWidth: sidePanelWidth.value,
       agentPanelWidth: agentPanelWidth.value
@@ -228,14 +236,11 @@
     uiState.removeSession(tabId)
   }
 
-  function togglePanel(panel: 'files' | 'git') {
-    if (panel === 'files') {
-      showFiles.value = !showFiles.value
-      if (showFiles.value) showGit.value = false
-    } else {
-      showGit.value = !showGit.value
-      if (showGit.value) showFiles.value = false
-    }
+  function togglePanel(panel: 'files' | 'git' | 'controlled') {
+    const next = panel === 'files' ? !showFiles.value : panel === 'git' ? !showGit.value : !showControlled.value
+    showFiles.value = panel === 'files' && next
+    showGit.value = panel === 'git' && next
+    showControlled.value = panel === 'controlled' && next
   }
 
   function toggleAgent() {
@@ -437,6 +442,22 @@
               <i class="i-ri:git-branch-line" style="display: inline-block; width: 14px; height: 14px" />
             </template>
           </n-button>
+          <n-tooltip v-if="features.has('controlled-commands')">
+            <template #trigger>
+              <n-button
+                size="tiny"
+                quaternary
+                class="mr-1"
+                :type="showControlled ? 'primary' : 'default'"
+                @click="togglePanel('controlled')"
+              >
+                <template #icon>
+                  <i class="i-ri:shield-flash-line" style="display: inline-block; width: 14px; height: 14px" />
+                </template>
+              </n-button>
+            </template>
+            受管命令（服务端执行、可审批、全量登记）
+          </n-tooltip>
           <!-- Theme -->
           <n-dropdown :options="themeOptions" trigger="click" @select="handleThemeSelect">
             <n-button size="tiny" quaternary class="mr-2">
@@ -522,6 +543,7 @@
                   @path-change="(p: string) => handleFilePathChange(tab.id, p)"
                 />
                 <git-panel v-else-if="sidePanel === 'git'" :session-id="tab.id" />
+                <controlled-command-panel v-else-if="sidePanel === 'controlled'" :session-id="tab.id" />
               </div>
             </template>
             <!-- Agent panel (side by side) -->

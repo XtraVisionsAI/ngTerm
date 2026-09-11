@@ -19,6 +19,7 @@ declare module 'vue' {
     AuditSystem: typeof import('./../../src/pages/audit/components/audit-system.vue')['default']
     ConfigChangeDetail: typeof import('./../../src/pages/audit/components/config-change-detail.vue')['default']
     ConnectionList: typeof import('./../../src/components/sidebar/ConnectionList.vue')['default']
+    ControlledCommandPanel: typeof import('./../../src/components/controlled-command-panel.vue')['default']
     CredentialList: typeof import('./../../src/components/sidebar/CredentialList.vue')['default']
     FileExplorer: typeof import('./../../src/components/file-explorer/FileExplorer.vue')['default']
     GitPanel: typeof import('./../../src/components/git-panel.vue')['default']

@@ -12,6 +12,7 @@ export interface UiSessionState {
 export interface UiLayoutState {
   showFiles?: boolean
   showGit?: boolean
+  showControlled?: boolean
   showAgent?: boolean
   sidePanelWidth?: number
   agentPanelWidth?: number

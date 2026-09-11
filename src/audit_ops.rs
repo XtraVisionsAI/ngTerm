@@ -50,6 +50,31 @@ impl ManagedOp {
 
     /// The executor reported an error; no exit code exists for SFTP/helper
     /// failures, so the reason is kept and the code left unknown.
+    /// The executor reported an exit code: 0 is success, anything else a
+    /// failure, both confirmed by the executor.
+    pub fn exited(self, code: i64) {
+        self.finish(OperationOutcome {
+            status: if code == 0 {
+                OperationStatus::Succeeded
+            } else {
+                OperationStatus::Failed
+            },
+            exit: ExitStatus::Known { code },
+            evidence: Evidence::ExecutorConfirmed,
+        })
+    }
+
+    /// The caller stopped waiting; whether the command ended is not known.
+    pub fn timed_out(self, reason: &str) {
+        self.finish(OperationOutcome {
+            status: OperationStatus::TimedOut,
+            exit: ExitStatus::Unknown {
+                reason: audit_events::redact(reason),
+            },
+            evidence: Evidence::None,
+        })
+    }
+
     pub fn failed(self, reason: &str) {
         self.finish(OperationOutcome {
             status: OperationStatus::Failed,

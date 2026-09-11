@@ -1476,7 +1476,9 @@ pub fn guard_response(decision: crate::guard::GuardDecision) -> axum::response::
     }
 }
 
-fn op_error_response(e: OpError) -> axum::response::Response {
+/// HTTP answer for a managed-operation error: guard decisions map to 403 /
+/// 202, an unrecordable intent to 503, an executor failure to 500.
+pub fn op_error_response(e: OpError) -> axum::response::Response {
     match e {
         OpError::Blocked(decision) => guard_response(decision),
         OpError::AuditRefused(msg) => (
@@ -1526,7 +1528,11 @@ struct RenameRequest {
     to: String,
 }
 
-async fn ensure_helper(
+/// Make sure the helper connection (SFTP/exec channels next to the user's
+/// terminal) for `session_id` exists, opening it with the caller's key when
+/// needed. Public so distributions can run their own session-scoped
+/// operations through the same connection.
+pub async fn ensure_helper(
     state: &Arc<AppState>,
     session_id: &str,
     user_id: &str,

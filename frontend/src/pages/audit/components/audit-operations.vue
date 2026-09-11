@@ -344,6 +344,17 @@
           <div v-for="ev in detail.events.filter((e) => !configChange(e))" :key="ev.eventId" class="mb-1 text-xs">
             <span class="opacity-60">{{ formatTime(ev.occurredAt) }}</span>
             <span class="ml-2 font-mono">{{ ev.eventType }}</span>
+            <template v-if="ev.eventType === 'command.output'">
+              <span class="ml-2 opacity-60">
+                exit {{ ev.payload.exitCode }} · {{ ev.payload.durationMs }} ms
+                <span v-if="ev.payload.truncated" class="text-om-warning"
+                  >· 输出已截断（共 {{ ev.payload.outputBytes }} 字节）</span
+                >
+              </span>
+              <pre class="mt-1 max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-om-bg p-2 font-mono">{{
+                (ev.payload.output as string) || '(无输出)'
+              }}</pre>
+            </template>
           </div>
         </template>
         <n-empty v-if="detail.events.length === 0" description="该操作没有附加事件" size="small" class="mt-4" />

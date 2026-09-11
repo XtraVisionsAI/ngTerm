@@ -63,6 +63,7 @@ The crate builds as both a lib (`ngterm`) and a binary. Downstream distributions
 - `Database::seed_tool_if_missing()` — register bundled tool definitions
 - `guard::ExecutionGuard` + `AppState::install_guard()` — neutral pre-execution check (session admission, managed operations); answers proceed / refuse / await approval
 - `RouterHooks::extra_api` / `RouterHooks::features` — extra `/api` routes and `GET /api/features` for the shared frontend
+- `web::ensure_helper()` / `web::op_error_response()` / `audit_ops::run_begin()` — run a session-scoped managed operation from an extra route with the same helper connection, guard and audit handling
 
 ### Key Crypto Flow
 
