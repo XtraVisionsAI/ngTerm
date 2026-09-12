@@ -1,6 +1,7 @@
 <script setup lang="ts">
   import { NTabPane, NTabs } from 'naive-ui'
   import { ref } from 'vue'
+  import { useRoute } from 'vue-router'
   import { useAuthStore } from '@/stores/auth'
   import AuditConnections from './components/audit-connections.vue'
   import AuditOperations from './components/audit-operations.vue'
@@ -8,7 +9,11 @@
   import AuditSystem from './components/audit-system.vue'
 
   const auth = useAuthStore()
-  const tab = ref<'sessions' | 'operations' | 'connections' | 'system'>('sessions')
+  const route = useRoute()
+  // `/audit?operationId=…` (from the task center) lands on that operation.
+  const tab = ref<'sessions' | 'operations' | 'connections' | 'system'>(
+    route.query.operationId ? 'operations' : 'sessions'
+  )
 </script>
 
 <template>

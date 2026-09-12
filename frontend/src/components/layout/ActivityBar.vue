@@ -36,6 +36,7 @@
   ]
 
   const approvalsItem: ActivityItem = { icon: 'i-ri:checkbox-multiple-line', key: '/approvals', tooltip: '审批' }
+  const tasksItem: ActivityItem = { icon: 'i-ri:task-line', key: '/tasks', tooltip: 'AI 任务' }
 
   const adminItems: ActivityItem[] = [
     { icon: 'i-ri:dashboard-line', key: '/admin', tooltip: '面板' },
@@ -46,7 +47,10 @@
 
   const items = computed(() => {
     const base = props.isAdmin ? adminItems : userItems
-    return features.approvals ? [...base, approvalsItem] : base
+    const extra: ActivityItem[] = []
+    if (features.tasks) extra.push(tasksItem)
+    if (features.approvals) extra.push(approvalsItem)
+    return [...base, ...extra]
   })
 
   // Pending approvals waiting for this person; polled while the feature is on.

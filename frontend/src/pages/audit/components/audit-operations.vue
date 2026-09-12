@@ -20,7 +20,7 @@
     useMessage
   } from 'naive-ui'
   import { computed, h, onMounted, ref, watch } from 'vue'
-  import { useRouter } from 'vue-router'
+  import { useRoute, useRouter } from 'vue-router'
   import { useApi } from '@/composables/useApi'
   import { useAuthStore } from '@/stores/auth'
   import { actorKindLabel, evidenceLabel, exitLabel, kindLabel, sourceLabel, statusInfo } from '@/utils/audit'
@@ -31,6 +31,7 @@
   const api = useApi()
   const auth = useAuthStore()
   const router = useRouter()
+  const route = useRoute()
   const message = useMessage()
 
   const items = ref<OperationRecord[]>([])
@@ -88,7 +89,11 @@
     }, 300)
   })
 
-  onMounted(load)
+  onMounted(() => {
+    load()
+    const linked = route.query.operationId
+    if (typeof linked === 'string' && linked) openDetailById(linked)
+  })
   watch([page, pageSize], load)
   watch([filterStatus, filterKind, filterActor, filterTimeRange], () => {
     page.value = 1
