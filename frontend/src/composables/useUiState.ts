@@ -18,10 +18,19 @@ export interface UiLayoutState {
   agentPanelWidth?: number
 }
 
+/** Per-user connection preferences (UX-05); synced with the layout state. */
+export interface UiPrefs {
+  /** Server ids pinned to the top of the connection list. */
+  favorites?: string[]
+  /** Directory bookmarks per server id. */
+  bookmarks?: Record<string, string[]>
+}
+
 export interface UiState {
   layout?: UiLayoutState
   activeSessionId?: string | null
   sessions?: Record<string, UiSessionState>
+  prefs?: UiPrefs
 }
 
 const STORAGE_KEY = 'onemux-ui-state'
@@ -94,6 +103,11 @@ export function useUiState() {
     scheduleSave()
   }
 
+  function updatePrefs(patch: Partial<UiPrefs>) {
+    cachedState.prefs = { ...cachedState.prefs, ...patch }
+    scheduleSave()
+  }
+
   function setActiveSession(sessionId: string | null) {
     cachedState.activeSessionId = sessionId
     scheduleSave()
@@ -131,6 +145,7 @@ export function useUiState() {
     updateLayout,
     setActiveSession,
     removeSession,
-    flush
+    flush,
+    updatePrefs
   }
 }

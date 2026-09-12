@@ -26,6 +26,7 @@ pub mod server_tool_config;
 pub mod session_manager;
 pub mod sftp_bridge;
 pub mod ssh_bridge;
+pub mod ssh_config_import;
 pub mod user_tool_config;
 pub mod utils;
 pub mod web;

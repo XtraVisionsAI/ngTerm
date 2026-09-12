@@ -102,6 +102,7 @@ pub fn build_router_with_hooks(state: Arc<AppState>, hooks: RouterHooks) -> Rout
         .route("/servers/{id}", put(handle_update_server))
         .route("/servers/{id}", delete(handle_delete_server))
         .route("/servers/{id}/test", post(handle_test_server))
+        .route("/servers/import-ssh-config", post(handle_import_ssh_config))
         // Keys
         .route("/keys", get(handle_list_keys))
         .route("/keys", post(handle_create_key))
@@ -836,6 +837,141 @@ async fn handle_create_server(
         Ok(server) => (StatusCode::CREATED, Json(server)).into_response(),
         Err(e) => config_error_response(e, StatusCode::BAD_REQUEST),
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSshConfigRequest {
+    pub text: String,
+    /// Parse and match only; create nothing.
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub group_name: Option<String>,
+    /// Key to assign to hosts whose IdentityFile did not match a stored key.
+    #[serde(default)]
+    pub default_key_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportCandidate {
+    #[serde(flatten)]
+    parsed: crate::ssh_config_import::ParsedHost,
+    /// Stored key matched by IdentityFile name, or the default.
+    key_id: Option<String>,
+    key_matched_by_name: bool,
+    /// An existing server already has this alias, or this user@host:port.
+    exists: bool,
+}
+
+/// Import a declared subset of an OpenSSH client config. Always returns the
+/// preview (candidates + skipped blocks with reasons); with `dryRun=false`
+/// creates the candidates that do not already exist, tagged
+/// `import:ssh-config`.
+async fn handle_import_ssh_config(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Json(req): Json<ImportSshConfigRequest>,
+) -> impl IntoResponse {
+    if req.text.len() > 256 * 1024 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ApiError {
+                error: "config text too large (max 256 KiB)".into(),
+            }),
+        )
+            .into_response();
+    }
+    let parsed = crate::ssh_config_import::parse(&req.text);
+    let keys = key_manager::list_keys(&state.db, &caller.user_id).unwrap_or_default();
+    let existing = server_registry::list_servers(&state.db, None).unwrap_or_default();
+    let group = req
+        .group_name
+        .clone()
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty());
+
+    let candidates: Vec<ImportCandidate> = parsed
+        .hosts
+        .into_iter()
+        .map(|h| {
+            let by_name = h.identity_file.as_deref().and_then(|f| {
+                keys.iter()
+                    .find(|k| k.name == f || k.name.trim_end_matches(".pub") == f)
+                    .map(|k| k.id.clone())
+            });
+            let exists = existing.iter().any(|s| {
+                s.alias == h.alias
+                    || (s.host == h.host
+                        && s.port == h.port
+                        && h.username.as_deref().is_some_and(|u| u == s.username))
+            });
+            ImportCandidate {
+                key_id: by_name.clone().or_else(|| req.default_key_id.clone()),
+                key_matched_by_name: by_name.is_some(),
+                exists,
+                parsed: h,
+            }
+        })
+        .collect();
+
+    let mut created: Vec<server_registry::Server> = Vec::new();
+    let mut errors: Vec<serde_json::Value> = Vec::new();
+    if !req.dry_run {
+        for c in candidates.iter().filter(|c| !c.exists) {
+            let Some(username) = c.parsed.username.clone() else {
+                errors.push(serde_json::json!({
+                    "alias": c.parsed.alias, "error": "no User in the block; set one and retry"
+                }));
+                continue;
+            };
+            let create = server_registry::CreateServerRequest {
+                group_name: group.clone(),
+                alias: c.parsed.alias.clone(),
+                host: c.parsed.host.clone(),
+                port: Some(c.parsed.port),
+                username: username.clone(),
+                key_id: c.key_id.clone(),
+                tags: Some(vec!["import:ssh-config".to_string()]),
+                ai_tool_id: None,
+            };
+            let change = Change::new(
+                ObjectKind::Server,
+                Action::Create,
+                format!(
+                    "import server {} ({}@{}) from ssh config",
+                    create.alias, username, create.host
+                ),
+            )
+            .target(audit_events::Target {
+                server_alias: Some(create.alias.clone()),
+                server_host: Some(create.host.clone()),
+                remote_user: Some(username.clone()),
+                ..Default::default()
+            });
+            let result = audit_config::run(&state, &caller, change, async {
+                let server = server_registry::create_server(&state.db, &create)?;
+                Ok(Applied::new(server.clone())
+                    .object_id(server.id.clone())
+                    .after(Some(audit_config::server_snapshot(&server))))
+            })
+            .await;
+            match result {
+                Ok(s) => created.push(s),
+                Err(e) => errors.push(serde_json::json!({
+                    "alias": c.parsed.alias, "error": format!("{:?}", e)
+                })),
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "candidates": candidates,
+        "skipped": parsed.skipped,
+        "created": created,
+        "errors": errors,
+    }))
+    .into_response()
 }
 
 async fn handle_delete_server(

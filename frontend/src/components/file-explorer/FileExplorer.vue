@@ -5,6 +5,8 @@
   import { useApi } from '@/composables/useApi'
   import { useFileExplorer } from '@/composables/useFileExplorer'
   import { useFileTransfer } from '@/composables/useFileTransfer'
+  import { usePrefsStore } from '@/stores/prefs'
+  import { useSessionStore } from '@/stores/session'
 
   const props = defineProps<{
     sessionId: string
@@ -22,6 +24,33 @@
     () => props.initialPath
   )
   const transfer = useFileTransfer()
+
+  // Directory bookmarks are per server (UX-05); the session tells us which.
+  const prefs = usePrefsStore()
+  const sessionStore = useSessionStore()
+  prefs.load()
+  const serverId = computed(() => sessionStore.tabs.find((t) => t.id === props.sessionId)?.serverId || '')
+  const bookmarks = computed(() => (serverId.value ? prefs.bookmarksFor(serverId.value) : []))
+  const currentBookmarked = computed(
+    () => !!serverId.value && prefs.hasBookmark(serverId.value, explorer.currentPath.value)
+  )
+  function toggleBookmark() {
+    if (!serverId.value) return
+    prefs.toggleBookmark(serverId.value, explorer.currentPath.value)
+  }
+  const bookmarkMenu = ref({ show: false, x: 0, y: 0 })
+  const bookmarkOptions = computed(() =>
+    bookmarks.value.length
+      ? bookmarks.value.map((p) => ({ label: p, key: p }))
+      : [{ label: '（没有书签：点击 ☆ 收藏当前目录）', key: '__none', disabled: true }]
+  )
+  function openBookmarkMenu(e: MouseEvent) {
+    bookmarkMenu.value = { show: true, x: e.clientX, y: e.clientY }
+  }
+  function handleBookmarkSelect(key: string) {
+    bookmarkMenu.value.show = false
+    if (key !== '__none') explorer.navigate(key)
+  }
 
   watch(
     () => explorer.currentPath.value,
@@ -374,6 +403,30 @@
       <n-button quaternary size="tiny" title="复制路径" @click="copyPath">
         <template #icon><i class="i-ri:clipboard-line block size-3.5" /></template>
       </n-button>
+      <n-button
+        quaternary
+        size="tiny"
+        :title="currentBookmarked ? '取消收藏此目录' : '收藏此目录'"
+        :disabled="!serverId"
+        @click="toggleBookmark"
+      >
+        <template #icon>
+          <i :class="currentBookmarked ? 'i-ri:star-fill text-om-warning' : 'i-ri:star-line'" class="block size-3.5" />
+        </template>
+      </n-button>
+      <n-button quaternary size="tiny" title="目录书签" :disabled="!serverId" @click="openBookmarkMenu">
+        <template #icon><i class="i-ri:bookmark-line block size-3.5" /></template>
+      </n-button>
+      <n-dropdown
+        trigger="manual"
+        placement="bottom-start"
+        :show="bookmarkMenu.show"
+        :x="bookmarkMenu.x"
+        :y="bookmarkMenu.y"
+        :options="bookmarkOptions"
+        @select="handleBookmarkSelect"
+        @clickoutside="bookmarkMenu.show = false"
+      />
       <div class="mx-1 h-4 w-px bg-om-border" />
       <n-button quaternary size="tiny" title="上传" @click="triggerUpload">
         <template #icon><i class="i-ri:upload-2-line block size-3.5" /></template>

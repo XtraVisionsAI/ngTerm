@@ -1,7 +1,18 @@
 <script setup lang="ts">
   import type { FormInst, FormRules } from 'naive-ui'
   import type { Server } from '@/stores/server'
-  import { NButton, NForm, NFormItem, NInput, NInputNumber, NModal, NSelect, NSpace, useMessage } from 'naive-ui'
+  import {
+    NButton,
+    NDynamicTags,
+    NForm,
+    NFormItem,
+    NInput,
+    NInputNumber,
+    NModal,
+    NSelect,
+    NSpace,
+    useMessage
+  } from 'naive-ui'
   import { computed, ref, watch } from 'vue'
   import { useApi } from '@/composables/useApi'
   import { useServerStore } from '@/stores/server'
@@ -28,7 +39,8 @@
     port: 22,
     username: 'root',
     keyId: null as string | null,
-    aiToolId: null as string | null
+    aiToolId: null as string | null,
+    tags: [] as string[]
   })
 
   const serverRules: FormRules = {
@@ -53,7 +65,8 @@
             port: s.port,
             username: s.username,
             keyId: s.keyId,
-            aiToolId: s.aiToolId
+            aiToolId: s.aiToolId,
+            tags: [...(s.tags || [])]
           }
         } else {
           serverForm.value = {
@@ -63,7 +76,8 @@
             port: 22,
             username: 'root',
             keyId: null,
-            aiToolId: null
+            aiToolId: null,
+            tags: []
           }
         }
       }
@@ -141,6 +155,14 @@
           />
         </n-form-item>
       </div>
+      <n-form-item label="标签" path="tags">
+        <n-dynamic-tags v-model:value="serverForm.tags" size="small" />
+        <template #feedback>
+          <span class="text-xs text-om-dimmed"
+            >环境标记：env:prod / env:staging / env:dev（或直接写 prod、dev）会在列表中高亮显示</span
+          >
+        </template>
+      </n-form-item>
       <n-space justify="end">
         <n-button @click="emit('update:show', false)">取消</n-button>
         <n-button type="primary" attr-type="submit">

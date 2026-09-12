@@ -9,6 +9,7 @@
   import CredentialList from '@/components/sidebar/CredentialList.vue'
   import KeyFormModal from '@/components/sidebar/KeyFormModal.vue'
   import ServerFormModal from '@/components/sidebar/ServerFormModal.vue'
+  import SshConfigImportModal from '@/components/sidebar/SshConfigImportModal.vue'
   import UserFooter from '@/components/sidebar/UserFooter.vue'
   import { useApi } from '@/composables/useApi'
   import { useAuthStore } from '@/stores/auth'
@@ -94,6 +95,7 @@
 
   // --- Server CRUD ---
   const showServerModal = ref(false)
+  const showImportModal = ref(false)
   const editingServer = ref<Server | null>(null)
 
   function openCreateServer() {
@@ -154,6 +156,7 @@
             v-if="activePanel === 'connections'"
             @connect="handleConnect"
             @create="openCreateServer"
+            @import="showImportModal = true"
             @edit="openEditServer"
             @delete="handleDeleteServer"
           />
@@ -209,6 +212,7 @@
           <connection-list
             @connect="handleConnect"
             @create="openCreateServer"
+            @import="showImportModal = true"
             @edit="openEditServer"
             @delete="handleDeleteServer"
           />
@@ -220,6 +224,7 @@
 
   <!-- Modals -->
   <server-form-modal v-model:show="showServerModal" :editing-server="editingServer" @saved="loadData" />
+  <ssh-config-import-modal v-model:show="showImportModal" @saved="loadData" />
   <key-form-modal v-model:show="showKeyModal" @saved="loadData" />
 </template>
 
