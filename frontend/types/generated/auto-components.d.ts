@@ -13,6 +13,7 @@ declare module 'vue' {
   export interface GlobalComponents {
     ActivityBar: typeof import('./../../src/components/layout/ActivityBar.vue')['default']
     AgentChat: typeof import('./../../src/components/agent-chat.vue')['default']
+    AiContextBar: typeof import('./../../src/components/ai-context-bar.vue')['default']
     AuditConnections: typeof import('./../../src/pages/audit/components/audit-connections.vue')['default']
     AuditOperations: typeof import('./../../src/pages/audit/components/audit-operations.vue')['default']
     AuditSessions: typeof import('./../../src/pages/audit/components/audit-sessions.vue')['default']

@@ -1,7 +1,7 @@
 <script setup lang="ts">
   import type { FileEntry } from '@/composables/useFileExplorer'
   import { NButton, NDropdown, NEmpty, NInput, NModal, NSpin, NVirtualList, useMessage } from 'naive-ui'
-  import { computed, nextTick, ref, watch } from 'vue'
+  import { computed, inject, nextTick, ref, watch } from 'vue'
   import { useApi } from '@/composables/useApi'
   import { useFileExplorer } from '@/composables/useFileExplorer'
   import { useFileTransfer } from '@/composables/useFileTransfer'
@@ -46,6 +46,30 @@
   const showHidden = ref(true)
   const transferExpanded = ref(true)
 
+  /** Provided by the terminal page: queue a file's content as AI context. */
+  const addAiContext = inject<
+    ((paneId: string, text: string, opts?: { analyze?: boolean; kind?: 'file'; title?: string }) => void) | undefined
+  >('addAiContext', undefined)
+  const AI_CONTEXT_MAX_BYTES = 512 * 1024
+
+  async function addFileToAiContext(entry: FileEntry) {
+    if (!addAiContext) return
+    if (entry.size > AI_CONTEXT_MAX_BYTES) {
+      message.warning(`文件超过 ${AI_CONTEXT_MAX_BYTES / 1024} KiB，请下载后裁剪再添加`)
+      return
+    }
+    const base = explorer.currentPath.value
+    const path = base.endsWith('/') ? `${base}${entry.name}` : `${base}/${entry.name}`
+    try {
+      const r = await api.get<{ content: string }>(
+        `/sessions/${props.sessionId}/files/content?path=${encodeURIComponent(path)}`
+      )
+      addAiContext(props.sessionId, r.content, { kind: 'file', title: path })
+    } catch (e) {
+      message.error(`读取文件失败: ${(e as Error).message}`)
+    }
+  }
+
   const contextMenuOptions = computed(() => {
     const entry = contextMenu.value.entry
     if (!entry) {
@@ -61,6 +85,7 @@
       items.push({ label: '打开', key: 'open' })
     } else {
       items.push({ label: '下载', key: 'download' })
+      if (addAiContext) items.push({ label: '添加到 AI 上下文', key: 'aiContext' })
     }
     items.push({ label: '重命名', key: 'rename' })
     items.push({ label: '删除', key: 'delete' })
@@ -118,6 +143,9 @@
         break
       case 'download':
         transfer.enqueueDownload(props.sessionId, path)
+        break
+      case 'aiContext':
+        addFileToAiContext(entry)
         break
       case 'rename':
         renameTarget.value = entry

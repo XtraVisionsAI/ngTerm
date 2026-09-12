@@ -13,12 +13,14 @@
     useMessage
   } from 'naive-ui'
   import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+  import AiContextBar from '@/components/ai-context-bar.vue'
   import ChangePreview from '@/components/change-preview.vue'
   import ServerToolConfigForm from '@/components/server-tool-config-form.vue'
   import ToolConfigForm from '@/components/tool-config-form.vue'
   import { useAgentSocket } from '@/composables/useAgentSocket'
   import { useApi } from '@/composables/useApi'
   import { renderMarkdown } from '@/composables/useMarkdown'
+  import { composeMessage, useAiContextStore } from '@/stores/aiContext'
   import { useSessionStore } from '@/stores/session'
 
   interface ParamDef {
@@ -294,10 +296,35 @@
     nextTick(scrollToBottom)
   }
 
+  const aiContext = useAiContextStore()
+  const contextItems = computed(() => aiContext.forTab(props.sessionId))
+  const sendableContext = computed(() => contextItems.value.filter((it) => it.serverId === currentServerId.value))
+  const foreignContext = computed(() => contextItems.value.filter((it) => it.serverId !== currentServerId.value))
+  const canSend = computed(() => !!inputText.value.trim() || sendableContext.value.length > 0)
+
+  // A source (e.g. "analyse this error" in the terminal) can prefill the prompt.
+  watch(
+    () => aiContext.pendingPrompt.get(props.sessionId),
+    (p) => {
+      if (!p) return
+      const prompt = aiContext.takePrompt(props.sessionId)
+      if (prompt && !inputText.value.trim()) inputText.value = prompt
+    },
+    { immediate: true }
+  )
+
   function sendMessage() {
     const text = inputText.value.trim()
-    if (!text || !socket) return
-    socket.sendMessage(text)
+    if (!socket) return
+    if (foreignContext.value.length > 0) {
+      // Bound to another server: never silently drop or silently send.
+      message.warning(`${foreignContext.value.length} 条上下文来自其他服务器的分屏，不会发送；请移除后重试`)
+      return
+    }
+    const ctx = sendableContext.value
+    if (!text && ctx.length === 0) return
+    socket.sendMessage(composeMessage(text, ctx))
+    for (const it of ctx) aiContext.remove(it.id)
     inputText.value = ''
     nextTick(scrollToBottom)
   }
@@ -745,21 +772,17 @@
 
       <!-- Input -->
       <div class="border-t border-om-border p-3">
+        <ai-context-bar :tab-id="sessionId" :server-id="currentServerId" />
         <div class="mx-auto max-w-3xl flex items-end gap-2">
           <n-input
             v-model:value="inputText"
             type="textarea"
             :autosize="{ minRows: 1, maxRows: 4 }"
-            placeholder="发送消息..."
+            :placeholder="contextItems.length ? `附带 ${contextItems.length} 条上下文发送...` : '发送消息...'"
             :disabled="status === 'disconnected'"
             @keydown="handleKeyDown"
           />
-          <n-button
-            type="primary"
-            size="small"
-            :disabled="!inputText.trim() || status === 'disconnected'"
-            @click="sendMessage"
-          >
+          <n-button type="primary" size="small" :disabled="!canSend || status === 'disconnected'" @click="sendMessage">
             <template #icon>
               <i class="i-ri:send-plane-2-fill" style="display: inline-block; width: 14px; height: 14px" />
             </template>

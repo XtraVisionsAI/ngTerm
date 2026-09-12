@@ -21,6 +21,7 @@
   import { postWithAdmission } from '@/composables/useSessionAdmission'
   import { useTerminalTheme } from '@/composables/useTerminalTheme'
   import { useUiState } from '@/composables/useUiState'
+  import { useAiContextStore } from '@/stores/aiContext'
   import { useFeaturesStore } from '@/stores/features'
   import { useSessionStore } from '@/stores/session'
 
@@ -38,6 +39,58 @@
 
   const terminalRefs = ref<Record<string, InstanceType<typeof TerminalView>>>({})
   provide('terminalRefs', terminalRefs)
+  const aiContext = useAiContextStore()
+  const showAgent = ref(false)
+  /**
+   * Queue text captured in pane `paneId` as context for the active tab's
+   * agent. The item is bound to the pane's session and server; the chat
+   * refuses items from another server, so a split pane of a different host
+   * cannot leak into this conversation.
+   */
+  provide(
+    'addAiContext',
+    (
+      paneId: string,
+      text: string,
+      opts?: { analyze?: boolean; kind?: 'terminal' | 'file' | 'diff'; title?: string }
+    ) => {
+      const tabId = sessionStore.activeTabId
+      const tab = sessionStore.tabs.find((t) => t.id === tabId)
+      if (!tabId || !tab) return
+      if (!text.trim()) {
+        message.warning('内容为空，未添加')
+        return
+      }
+      const kind = opts?.kind || 'terminal'
+      const lines = text.replace(/\s+$/, '').split('\n')
+      const title =
+        opts?.title ||
+        (kind === 'diff'
+          ? `git diff（${lines.length} 行）`
+          : lines.length > 1
+            ? `终端选区（${lines.length} 行）`
+            : `终端选区`)
+      aiContext.add({
+        kind,
+        title,
+        text: text.replace(/\s+$/, ''),
+        tabId,
+        paneId,
+        sessionId: paneId,
+        serverId: tab.serverId,
+        serverAlias: tab.serverAlias
+      })
+      if (opts?.analyze) {
+        aiContext.setPrompt(tabId, '请分析下面终端输出中的报错：说明原因，并给出可执行的修复步骤。')
+      }
+      if (!tab.aiToolId) {
+        message.warning('该标签未配置 AI 工具，上下文已暂存；在服务器设置中启用 AI 工具后可发送')
+        return
+      }
+      showAgent.value = true
+      message.success(opts?.analyze ? '已添加到 AI 上下文，请在对话中确认后发送' : '已添加到 AI 上下文')
+    }
+  )
   provide('insertToTerminal', (command: string, autoExec: boolean) => {
     const tabId = sessionStore.activeTabId
     if (!tabId) return
@@ -64,6 +117,7 @@
     )
     for (const tab of sessionStore.tabs) {
       if (tab.paneTree && updatePaneNodeId(tab.paneTree, pendingId, session.id)) {
+        aiContext.renameSession(pendingId, session.id)
         if (tab.activePaneId === pendingId) tab.activePaneId = session.id
         if (terminalRefs.value[pendingId]) {
           terminalRefs.value[session.id] = terminalRefs.value[pendingId]
@@ -107,6 +161,7 @@
     )
     for (const tab of sessionStore.tabs) {
       if (tab.paneTree && updatePaneNodeId(tab.paneTree, oldSessionId, session.id)) {
+        aiContext.renameSession(oldSessionId, session.id)
         if (tab.activePaneId === oldSessionId) tab.activePaneId = session.id
         if (terminalRefs.value[oldSessionId]) {
           terminalRefs.value[session.id] = terminalRefs.value[oldSessionId]
@@ -125,7 +180,6 @@
   const showControlled = ref(false)
   const features = useFeaturesStore()
   features.load()
-  const showAgent = ref(false)
   const sidePanelWidth = ref(320)
   const agentPanelWidth = ref(400)
   const restored = ref(false)
@@ -234,6 +288,7 @@
     }
     sessionStore.removeTab(tabId)
     uiState.removeSession(tabId)
+    aiContext.clearTab(tabId)
   }
 
   function togglePanel(panel: 'files' | 'git' | 'controlled') {

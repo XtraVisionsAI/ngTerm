@@ -27,6 +27,11 @@
   const sessionStore = useSessionStore()
   const api = useApi()
   const containerRef = ref<HTMLElement | null>(null)
+  /** Provided by the terminal page: queue text as AI context for this pane's tab. */
+  const addAiContext = inject<((paneId: string, text: string, opts?: { analyze?: boolean }) => void) | undefined>(
+    'addAiContext',
+    undefined
+  )
   const reconnectPaneSession = inject<(oldId: string, cols: number, rows: number) => Promise<{ id: string }>>(
     'reconnectPaneSession',
     undefined as any
@@ -107,6 +112,10 @@
     const items: Array<{ label: string; key: string } | { type: string; key: string }> = []
     if (terminal.value?.hasSelection()) {
       items.push({ label: '复制', key: 'copy' })
+      if (addAiContext) {
+        items.push({ label: '添加选区到 AI 上下文', key: 'aiContext' })
+        items.push({ label: '让 AI 分析此报错', key: 'aiAnalyze' })
+      }
     }
     items.push({ label: '粘贴', key: 'paste' })
     items.push({ label: '全选', key: 'selectAll' })
@@ -131,6 +140,15 @@
       case 'paste': {
         const text = await navigator.clipboard.readText()
         term.paste(text)
+        break
+      }
+      case 'aiContext':
+      case 'aiAnalyze': {
+        const text = term.getSelection()
+        if (text.trim() && addAiContext) {
+          addAiContext(realSessionId.value || props.sessionId, text, { analyze: key === 'aiAnalyze' })
+        }
+        term.clearSelection()
         break
       }
       case 'selectAll':

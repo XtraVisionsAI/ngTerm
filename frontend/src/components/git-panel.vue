@@ -1,6 +1,6 @@
 <script setup lang="ts">
   import { NButton, NEmpty, NSpin, NTag } from 'naive-ui'
-  import { onMounted, ref, watch } from 'vue'
+  import { inject, onMounted, ref, watch } from 'vue'
   import { useApi } from '@/composables/useApi'
 
   const props = defineProps<{
@@ -82,6 +82,16 @@
     } finally {
       loading.value = false
     }
+  }
+
+  /** Provided by the terminal page: queue the diff as AI context. */
+  const addAiContext = inject<
+    ((paneId: string, text: string, opts?: { kind?: 'diff'; title?: string }) => void) | undefined
+  >('addAiContext', undefined)
+
+  function addDiffToAiContext() {
+    if (!addAiContext || !diff.value.trim()) return
+    addAiContext(props.sessionId, diff.value, { kind: 'diff' })
   }
 
   async function loadDiff() {
@@ -170,6 +180,16 @@
       <template v-else-if="showDiff">
         <div class="flex items-center border-b border-om-border px-3 py-1.5">
           <n-button size="tiny" quaternary @click="showDiff = false">← 返回</n-button>
+          <n-button
+            v-if="addAiContext && diff.trim()"
+            size="tiny"
+            quaternary
+            class="ml-auto"
+            @click="addDiffToAiContext"
+          >
+            <template #icon><i class="i-ri:sparkling-line inline-block size-3.5" /></template>
+            添加到 AI 上下文
+          </n-button>
         </div>
         <pre class="overflow-auto p-3 text-xs leading-5 font-mono">
 <template v-for="(line, i) in diff.split('\n')" :key="i"><span :class="line.startsWith('+') ? 'text-om-success' : line.startsWith('-') ? 'text-om-danger' : line.startsWith('@@') ? 'text-om-primary' : 'text-om-text'">{{ line }}
