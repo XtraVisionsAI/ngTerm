@@ -37,6 +37,7 @@
 
   const approvalsItem: ActivityItem = { icon: 'i-ri:checkbox-multiple-line', key: '/approvals', tooltip: '审批' }
   const tasksItem: ActivityItem = { icon: 'i-ri:task-line', key: '/tasks', tooltip: 'AI 任务' }
+  const flowsItem: ActivityItem = { icon: 'i-ri:flow-chart', key: '/flows', tooltip: '运维流程' }
 
   const adminItems: ActivityItem[] = [
     { icon: 'i-ri:dashboard-line', key: '/admin', tooltip: '面板' },
@@ -49,6 +50,7 @@
     const base = props.isAdmin ? adminItems : userItems
     const extra: ActivityItem[] = []
     if (features.tasks) extra.push(tasksItem)
+    if (features.flows) extra.push(flowsItem)
     if (features.approvals) extra.push(approvalsItem)
     return [...base, ...extra]
   })
