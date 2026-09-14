@@ -23,6 +23,7 @@
   } from 'naive-ui'
   import { computed, h, onMounted, ref, watch } from 'vue'
   import { useRouter } from 'vue-router'
+  import LoadState from '@/components/load-state.vue'
   import { useApi } from '@/composables/useApi'
   import { renderMarkdown } from '@/composables/useMarkdown'
   import { useUiState } from '@/composables/useUiState'
@@ -52,8 +53,10 @@
     value: k
   }))
 
+  const loadError = ref<string | null>(null)
   async function load() {
     loading.value = true
+    loadError.value = null
     try {
       const params = new URLSearchParams()
       if (query.value.trim()) params.set('q', query.value.trim())
@@ -64,7 +67,7 @@
       items.value = r.items
       total.value = r.total
     } catch (e) {
-      message.error(`加载失败: ${(e as Error).message}`)
+      loadError.value = (e as Error).message
     } finally {
       loading.value = false
     }
@@ -106,6 +109,10 @@
     }
   }
 
+  /** Long transcripts render from the tail; older entries load on demand. */
+  const TRANSCRIPT_WINDOW = 100
+  const transcriptShown = ref(TRANSCRIPT_WINDOW)
+  watch(detail, () => (transcriptShown.value = TRANSCRIPT_WINDOW))
   const transcript = computed(() => {
     if (!detail.value) return []
     return detail.value.events
@@ -256,15 +263,23 @@
         style="width: 120px"
       />
     </n-space>
-    <div class="min-h-0 flex-1 overflow-auto">
-      <n-data-table
-        :columns="columns"
-        :data="items"
+    <div class="min-h-0 flex flex-1 flex-col overflow-auto">
+      <load-state
         :loading="loading"
-        :row-key="(r: TaskRecord) => r.taskId"
-        size="small"
-        :bordered="false"
-      />
+        :error="loadError"
+        :empty="items.length === 0"
+        empty-text="没有任务记录"
+        @retry="load"
+      >
+        <n-data-table
+          :columns="columns"
+          :data="items"
+          :loading="loading"
+          :row-key="(r: TaskRecord) => r.taskId"
+          size="small"
+          :bordered="false"
+        />
+      </load-state>
     </div>
     <div class="mt-2 flex justify-end">
       <n-pagination v-model:page="page" :page-size="pageSize" :item-count="total" size="small" />
@@ -344,7 +359,13 @@
           <!-- Transcript -->
           <div class="mb-1 mt-4 text-xs text-om-dimmed">对话记录（{{ transcript.length }} 条）</div>
           <div class="max-h-[50vh] overflow-auto border border-om-border rounded p-2 text-xs">
-            <div v-for="m in transcript" :key="m.seq" class="mb-2">
+            <div v-if="transcript.length > transcriptShown" class="mb-2 text-center">
+              <n-button size="tiny" quaternary @click="transcriptShown += TRANSCRIPT_WINDOW">
+                显示更早的 {{ Math.min(TRANSCRIPT_WINDOW, transcript.length - transcriptShown) }} 条（共
+                {{ transcript.length }} 条）
+              </n-button>
+            </div>
+            <div v-for="m in transcript.slice(-transcriptShown)" :key="m.seq" class="mb-2">
               <div class="mb-0.5 text-om-dimmed">
                 <span
                   :class="

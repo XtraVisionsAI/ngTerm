@@ -144,6 +144,13 @@
   const connected = ref(false)
   const status = ref<AgentStatus>('idle')
   const messages = ref<ReturnType<typeof useAgentSocket>['messages']['value']>([])
+  /** Long conversations render from the tail; older turns are revealed on demand. */
+  const MESSAGE_WINDOW = 120
+  const messagesShown = ref(MESSAGE_WINDOW)
+  const hiddenMessages = computed(() => Math.max(0, messages.value.length - messagesShown.value))
+  const visibleMessages = computed(() =>
+    hiddenMessages.value > 0 ? messages.value.slice(hiddenMessages.value) : messages.value
+  )
   const tokenUsage = ref({ input: 0, output: 0 })
   const costUsd = ref(0)
   const pendingApproval = ref<PermissionRequest | null>(null)
@@ -357,6 +364,7 @@
     connected.value = false
     status.value = 'idle'
     messages.value = []
+    messagesShown.value = MESSAGE_WINDOW
     pendingApproval.value = null
     pendingQuestion.value = null
   }
@@ -619,7 +627,12 @@
       <!-- Messages -->
       <div ref="messagesEl" class="min-h-0 flex-1 overflow-y-auto p-4">
         <div class="mx-auto max-w-3xl">
-          <div v-for="(msg, i) in messages" :key="i" class="mb-3">
+          <div v-if="hiddenMessages > 0" class="mb-3 text-center">
+            <n-button size="tiny" quaternary @click="messagesShown += MESSAGE_WINDOW">
+              显示更早的 {{ Math.min(MESSAGE_WINDOW, hiddenMessages) }} 条（共 {{ messages.length }} 条）
+            </n-button>
+          </div>
+          <div v-for="(msg, i) in visibleMessages" :key="hiddenMessages + i" class="mb-3">
             <!-- User message -->
             <div v-if="msg.role === 'user'" class="flex justify-end">
               <div

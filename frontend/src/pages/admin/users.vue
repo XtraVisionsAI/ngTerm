@@ -3,7 +3,6 @@
   import {
     NButton,
     NDataTable,
-    NEmpty,
     NForm,
     NFormItem,
     NInput,
@@ -14,6 +13,7 @@
     useMessage
   } from 'naive-ui'
   import { h, onActivated, onMounted, ref } from 'vue'
+  import LoadState from '@/components/load-state.vue'
   import { useApi } from '@/composables/useApi'
   import { formatTime } from '@/utils/format'
 
@@ -52,8 +52,18 @@
   onMounted(loadUsers)
   onActivated(loadUsers)
 
+  const loading = ref(false)
+  const loadError = ref<string | null>(null)
   async function loadUsers() {
-    users.value = await api.get<UserInfo[]>('/admin/users')
+    loading.value = true
+    loadError.value = null
+    try {
+      users.value = await api.get<UserInfo[]>('/admin/users')
+    } catch (e) {
+      loadError.value = (e as Error).message
+    } finally {
+      loading.value = false
+    }
   }
 
   const columns = [
@@ -147,14 +157,25 @@
       <h2 class="text-lg font-bold">用户管理</h2>
       <n-button type="primary" size="small" @click="showCreateModal = true"> 创建用户 </n-button>
     </div>
-    <div v-if="users.length === 0" class="flex flex-1 items-center justify-center">
-      <n-empty description="暂无用户">
-        <template #extra>
-          <n-button size="small" type="primary" @click="showCreateModal = true"> 创建第一个用户 </n-button>
-        </template>
-      </n-empty>
-    </div>
-    <n-data-table v-else :columns="columns" :data="users" :bordered="false" flex-height class="min-h-0 flex-1" />
+    <load-state
+      :loading="loading"
+      :error="loadError"
+      :empty="users.length === 0"
+      empty-text="暂无用户"
+      @retry="loadUsers"
+    >
+      <template #empty-extra>
+        <n-button size="small" type="primary" @click="showCreateModal = true"> 创建第一个用户 </n-button>
+      </template>
+      <n-data-table
+        :columns="columns"
+        :data="users"
+        :loading="loading"
+        :bordered="false"
+        flex-height
+        class="min-h-0 flex-1"
+      />
+    </load-state>
 
     <n-modal v-model:show="showCreateModal" title="创建用户" preset="card" class="w-100">
       <n-form ref="formRef" :model="createForm" :rules="createRules" @submit.prevent="handleCreate">

@@ -20,6 +20,7 @@
   } from 'naive-ui'
   import { computed, h, onMounted, ref, watch } from 'vue'
   import { useRouter } from 'vue-router'
+  import LoadState from '@/components/load-state.vue'
   import { useApi } from '@/composables/useApi'
   import { useAuthStore } from '@/stores/auth'
   import {
@@ -81,14 +82,16 @@
     return params
   }
 
+  const loadError = ref<string | null>(null)
   async function load() {
     loading.value = true
+    loadError.value = null
     try {
       const data = await api.get<{ items: AuditSession[]; total: number }>(`/audit/sessions?${buildParams(true)}`)
       items.value = data.items
       total.value = data.total
     } catch (e) {
-      message.error((e as Error).message)
+      loadError.value = (e as Error).message
     } finally {
       loading.value = false
     }
@@ -249,10 +252,13 @@
       </n-space>
     </div>
 
-    <div v-if="!loading && items.length === 0" class="flex flex-1 items-center justify-center">
-      <n-empty description="暂无会话记录" />
-    </div>
-    <template v-else>
+    <load-state
+      :loading="loading"
+      :error="loadError"
+      :empty="items.length === 0"
+      empty-text="暂无会话记录"
+      @retry="load"
+    >
       <n-data-table
         :columns="columns"
         :data="items"
@@ -272,7 +278,7 @@
           size="small"
         />
       </n-space>
-    </template>
+    </load-state>
 
     <n-drawer v-model:show="detailOpen" :width="720" placement="right">
       <n-drawer-content v-if="detail" title="会话详情" closable>

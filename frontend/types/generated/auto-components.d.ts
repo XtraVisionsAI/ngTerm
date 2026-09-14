@@ -28,6 +28,7 @@ declare module 'vue' {
     GitPanel: typeof import('./../../src/components/git-panel.vue')['default']
     JsonEditor: typeof import('./../../src/components/json-editor.vue')['default']
     KeyFormModal: typeof import('./../../src/components/sidebar/KeyFormModal.vue')['default']
+    LoadState: typeof import('./../../src/components/load-state.vue')['default']
     McpServerForm: typeof import('./../../src/components/mcp-server-form.vue')['default']
     ResizeHandle: typeof import('./../../src/components/layout/ResizeHandle.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']

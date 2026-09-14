@@ -1,7 +1,8 @@
 <script setup lang="ts">
   import type { OperationRecord } from '@/utils/audit'
-  import { NButton, NEmpty, NInput, NInputNumber, NTag, NTooltip, useMessage } from 'naive-ui'
+  import { NButton, NInput, NInputNumber, NTag, NTooltip, useMessage } from 'naive-ui'
   import { onMounted, ref, watch } from 'vue'
+  import LoadState from '@/components/load-state.vue'
   import { useApi } from '@/composables/useApi'
   import { postWithAdmission } from '@/composables/useSessionAdmission'
   import { statusInfo } from '@/utils/audit'
@@ -33,16 +34,19 @@
   const loadingHistory = ref(false)
   const selected = ref<{ op: OperationRecord; output: Record<string, unknown> | null } | null>(null)
 
+  const historyError = ref<string | null>(null)
   async function loadHistory() {
     loadingHistory.value = true
+    historyError.value = null
     try {
       const params = new URLSearchParams({ session: props.sessionId, kind: 'command', limit: '30' })
       const data = await api.get<{ items: OperationRecord[] }>(`/audit/operations?${params}`)
       // Only the controlled channel is submitted through the API; the
       // engine's commands come through chat/terminal sources.
       history.value = data.items.filter((o) => o.source === 'api')
-    } catch {
+    } catch (e) {
       history.value = []
+      historyError.value = (e as Error).message
     } finally {
       loadingHistory.value = false
     }
@@ -184,21 +188,29 @@
         <span>本会话的受管命令记录</span>
         <n-button text size="tiny" :loading="loadingHistory" @click="loadHistory">刷新</n-button>
       </div>
-      <n-empty v-if="history.length === 0" description="尚无记录" size="small" />
-      <div
-        v-for="op in history"
-        :key="op.operationId"
-        class="mb-1 cursor-pointer rounded px-2 py-1 hover:bg-om-bg"
-        @click="openHistory(op)"
+      <load-state
+        :loading="loadingHistory"
+        :error="historyError"
+        :empty="history.length === 0"
+        empty-text="尚无记录"
+        size="small"
+        @retry="loadHistory"
       >
-        <div class="flex items-center gap-2">
-          <n-tag size="tiny" :bordered="false" :type="statusInfo[op.status]?.type || 'default'">
-            {{ statusInfo[op.status]?.label || op.status }}
-          </n-tag>
-          <span class="truncate font-mono">{{ op.summary }}</span>
+        <div
+          v-for="op in history"
+          :key="op.operationId"
+          class="mb-1 cursor-pointer rounded px-2 py-1 hover:bg-om-bg"
+          @click="openHistory(op)"
+        >
+          <div class="flex items-center gap-2">
+            <n-tag size="tiny" :bordered="false" :type="statusInfo[op.status]?.type || 'default'">
+              {{ statusInfo[op.status]?.label || op.status }}
+            </n-tag>
+            <span class="truncate font-mono">{{ op.summary }}</span>
+          </div>
+          <div class="text-om-dimmed">{{ formatTime(op.startedAt) }} · {{ exitText(op) }}</div>
         </div>
-        <div class="text-om-dimmed">{{ formatTime(op.startedAt) }} · {{ exitText(op) }}</div>
-      </div>
+      </load-state>
 
       <div v-if="selected" class="mt-3 border-t border-om-border pt-2">
         <div class="mb-1 flex items-center justify-between">

@@ -1,18 +1,9 @@
 <script setup lang="ts">
   import type { DataTableColumns } from 'naive-ui'
   import type { AuditEvent, RuntimeMetrics, StartupReport } from '@/utils/audit'
-  import {
-    NAlert,
-    NButton,
-    NDataTable,
-    NDescriptions,
-    NDescriptionsItem,
-    NEmpty,
-    NSpace,
-    NTag,
-    useMessage
-  } from 'naive-ui'
+  import { NAlert, NButton, NDataTable, NDescriptions, NDescriptionsItem, NSpace, NTag, useMessage } from 'naive-ui'
   import { h, onMounted, ref } from 'vue'
+  import LoadState from '@/components/load-state.vue'
   import { useApi } from '@/composables/useApi'
   import { formatBytes, warningLabel } from '@/utils/audit'
   import { formatTime } from '@/utils/format'
@@ -50,14 +41,16 @@
   const metrics = ref<RuntimeMetrics | null>(null)
   const metricsError = ref<string | null>(null)
 
+  const loadError = ref<string | null>(null)
   async function load() {
     loading.value = true
+    loadError.value = null
     try {
       const data = await api.get<{ items: AuditEvent[]; current: StartupReport }>('/audit/system?limit=100')
       items.value = data.items
       current.value = data.current
     } catch (e) {
-      message.error((e as Error).message)
+      loadError.value = (e as Error).message
     } finally {
       loading.value = false
     }
@@ -227,18 +220,22 @@
         <n-descriptions-item label="活跃 Agent">{{ metrics.activeAgents }}</n-descriptions-item>
       </n-descriptions>
     </n-alert>
-    <div v-if="!loading && items.length === 0" class="flex flex-1 items-center justify-center">
-      <n-empty description="暂无系统事件" />
-    </div>
-    <n-data-table
-      v-else
-      :columns="columns"
-      :data="items"
+    <load-state
       :loading="loading"
-      :bordered="false"
-      :row-key="(r: AuditEvent) => r.eventId"
-      flex-height
-      class="min-h-0 flex-1"
-    />
+      :error="loadError"
+      :empty="items.length === 0"
+      empty-text="暂无系统事件"
+      @retry="load"
+    >
+      <n-data-table
+        :columns="columns"
+        :data="items"
+        :loading="loading"
+        :bordered="false"
+        :row-key="(r: AuditEvent) => r.eventId"
+        flex-height
+        class="min-h-0 flex-1"
+      />
+    </load-state>
   </div>
 </template>

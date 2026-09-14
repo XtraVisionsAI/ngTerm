@@ -19,6 +19,7 @@
   } from 'naive-ui'
   import { computed, h, onActivated, onBeforeUnmount, onMounted, ref, watch } from 'vue'
   import { useRoute } from 'vue-router'
+  import LoadState from '@/components/load-state.vue'
   import { useApi } from '@/composables/useApi'
   import { useAuthStore } from '@/stores/auth'
   import { approvalKindLabel, approvalStatusInfo, riskLevelLabel, secondsUntil } from '@/utils/approvals'
@@ -43,8 +44,10 @@
   const statusOptions = Object.entries(approvalStatusInfo).map(([value, info]) => ({ label: info.label, value }))
   const kindOptions = Object.entries(approvalKindLabel).map(([value, label]) => ({ label, value }))
 
+  const loadError = ref<string | null>(null)
   async function load() {
     loading.value = true
+    loadError.value = null
     try {
       const params = new URLSearchParams()
       params.set('view', view.value)
@@ -56,7 +59,7 @@
       items.value = data.items
       total.value = data.total
     } catch (e) {
-      message.error((e as Error).message)
+      loadError.value = (e as Error).message
     } finally {
       loading.value = false
     }
@@ -249,15 +252,23 @@
         style="width: 120px"
       />
     </n-space>
-    <div class="min-h-0 flex-1 overflow-auto">
-      <n-data-table
-        :columns="columns"
-        :data="items"
+    <div class="min-h-0 flex flex-1 flex-col overflow-auto">
+      <load-state
         :loading="loading"
-        :row-key="(r: ApprovalRequest) => r.requestId"
-        size="small"
-        :bordered="false"
-      />
+        :error="loadError"
+        :empty="items.length === 0"
+        empty-text="没有审批请求"
+        @retry="load"
+      >
+        <n-data-table
+          :columns="columns"
+          :data="items"
+          :loading="loading"
+          :row-key="(r: ApprovalRequest) => r.requestId"
+          size="small"
+          :bordered="false"
+        />
+      </load-state>
     </div>
     <div class="mt-2 flex justify-end">
       <n-pagination v-model:page="page" :page-size="pageSize" :item-count="total" size="small" />

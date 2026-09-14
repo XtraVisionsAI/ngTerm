@@ -26,6 +26,7 @@
   import { computed, h, onMounted, ref, watch } from 'vue'
   import RunView from '@/components/flow-run-view.vue'
   import JsonEditor from '@/components/json-editor.vue'
+  import LoadState from '@/components/load-state.vue'
   import { useApi } from '@/composables/useApi'
   import { postWithAdmission } from '@/composables/useSessionAdmission'
   import { useAuthStore } from '@/stores/auth'
@@ -41,16 +42,18 @@
   // --- flows ---
   const flows = ref<Flow[]>([])
   const loadingFlows = ref(false)
+  const flowsError = ref<string | null>(null)
   const selected = ref<Flow | null>(null)
 
   async function loadFlows() {
     loadingFlows.value = true
+    flowsError.value = null
     try {
       const r = await api.get<{ items: Flow[] }>('/flows')
       flows.value = r.items
       if (selected.value) selected.value = r.items.find((f) => f.flowId === selected.value!.flowId) || null
     } catch (e) {
-      message.error(`加载失败: ${(e as Error).message}`)
+      flowsError.value = (e as Error).message
     } finally {
       loadingFlows.value = false
     }
@@ -277,27 +280,35 @@
 
     <div class="min-h-0 flex flex-1 gap-3 overflow-hidden">
       <!-- Flow list -->
-      <div class="w-72 shrink-0 overflow-auto border border-om-border rounded">
-        <div
-          v-for="f in flows"
-          :key="f.flowId"
-          class="cursor-pointer border-b border-om-border px-3 py-2 hover:bg-om-hover"
-          :class="selected?.flowId === f.flowId ? 'bg-om-hover' : ''"
-          @click="selectFlow(f)"
+      <div class="w-72 flex shrink-0 flex-col overflow-auto border border-om-border rounded">
+        <load-state
+          :loading="loadingFlows"
+          :error="flowsError"
+          :empty="flows.length === 0"
+          empty-text="没有流程"
+          size="small"
+          @retry="loadFlows"
         >
-          <div class="flex items-center gap-2">
-            <span class="text-sm font-mono">{{ f.name }}</span>
-            <n-tag size="tiny" :bordered="false">v{{ f.version }}</n-tag>
-            <n-tag v-if="f.builtin" size="tiny" type="info" :bordered="false">内置</n-tag>
+          <div
+            v-for="f in flows"
+            :key="f.flowId"
+            class="cursor-pointer border-b border-om-border px-3 py-2 hover:bg-om-hover"
+            :class="selected?.flowId === f.flowId ? 'bg-om-hover' : ''"
+            @click="selectFlow(f)"
+          >
+            <div class="flex items-center gap-2">
+              <span class="text-sm font-mono">{{ f.name }}</span>
+              <n-tag size="tiny" :bordered="false">v{{ f.version }}</n-tag>
+              <n-tag v-if="f.builtin" size="tiny" type="info" :bordered="false">内置</n-tag>
+            </div>
+            <div class="line-clamp-2 mt-0.5 text-xs text-om-dimmed">{{ f.description }}</div>
+            <div class="mt-1 text-[10px] text-om-dimmed">
+              {{ f.definition.params.length }} 参数 · {{ f.definition.preChecks.length }} 前置检查 ·
+              {{ f.definition.steps.length }} 步骤
+              <span v-if="f.definition.steps.some((s) => s.approval === 'required')">· 含审批点</span>
+            </div>
           </div>
-          <div class="line-clamp-2 mt-0.5 text-xs text-om-dimmed">{{ f.description }}</div>
-          <div class="mt-1 text-[10px] text-om-dimmed">
-            {{ f.definition.params.length }} 参数 · {{ f.definition.preChecks.length }} 前置检查 ·
-            {{ f.definition.steps.length }} 步骤
-            <span v-if="f.definition.steps.some((s) => s.approval === 'required')">· 含审批点</span>
-          </div>
-        </div>
-        <div v-if="!flows.length && !loadingFlows" class="p-3 text-xs text-om-dimmed">没有流程</div>
+        </load-state>
       </div>
 
       <!-- Run panel -->

@@ -1,7 +1,8 @@
 <script setup lang="ts">
   import type { DataTableColumns } from 'naive-ui'
-  import { NDataTable, NDatePicker, NEmpty, NPagination, NSelect, NSpace, NTag } from 'naive-ui'
+  import { NDataTable, NDatePicker, NPagination, NSelect, NSpace, NTag } from 'naive-ui'
   import { computed, h, onActivated, onMounted, ref, watch } from 'vue'
+  import LoadState from '@/components/load-state.vue'
   import { useApi } from '@/composables/useApi'
   import { useAuthStore } from '@/stores/auth'
   import { formatDuration, formatTime } from '@/utils/format'
@@ -62,6 +63,8 @@
     } catch {}
   }
 
+  const loading = ref(false)
+  const loadError = ref<string | null>(null)
   async function loadLogs() {
     const offset = (page.value - 1) * pageSize.value
     const params = new URLSearchParams()
@@ -74,11 +77,17 @@
       params.set('timeFrom', new Date(filterTimeRange.value[0]).toISOString())
       params.set('timeTo', new Date(filterTimeRange.value[1]).toISOString())
     }
+    loading.value = true
+    loadError.value = null
     try {
       const data = await api.get<{ items: AuditLog[]; total: number }>(`/audit/logs?${params}`)
       logs.value = data.items
       total.value = data.total
-    } catch {}
+    } catch (e) {
+      loadError.value = (e as Error).message
+    } finally {
+      loading.value = false
+    }
   }
 
   const reasonMap: Record<string, { label: string; type: 'success' | 'warning' | 'error' | 'info' }> = {
@@ -163,11 +172,21 @@
         />
       </div>
     </div>
-    <div v-if="logs.length === 0" class="flex flex-1 items-center justify-center">
-      <n-empty description="暂无审计记录" />
-    </div>
-    <template v-else>
-      <n-data-table :columns="columns" :data="logs" :bordered="false" flex-height class="min-h-0 flex-1" />
+    <load-state
+      :loading="loading"
+      :error="loadError"
+      :empty="logs.length === 0"
+      empty-text="暂无审计记录"
+      @retry="loadLogs"
+    >
+      <n-data-table
+        :columns="columns"
+        :data="logs"
+        :loading="loading"
+        :bordered="false"
+        flex-height
+        class="min-h-0 flex-1"
+      />
       <n-space justify="end" class="mt-3">
         <n-pagination
           v-model:page="page"
@@ -178,6 +197,6 @@
           size="small"
         />
       </n-space>
-    </template>
+    </load-state>
   </div>
 </template>

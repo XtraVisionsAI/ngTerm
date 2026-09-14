@@ -1,6 +1,7 @@
 <script setup lang="ts">
-  import { NButton, NEmpty, NSpin, NTag } from 'naive-ui'
+  import { NButton, NSpin, NTag, useMessage } from 'naive-ui'
   import { inject, onMounted, ref, watch } from 'vue'
+  import LoadState from '@/components/load-state.vue'
   import { useApi } from '@/composables/useApi'
 
   const props = defineProps<{
@@ -8,6 +9,7 @@
   }>()
 
   const api = useApi()
+  const message = useMessage()
 
   interface GitFile {
     status: string
@@ -47,16 +49,21 @@
     }
   )
 
+  /** Per-view failure; a failed status load must not read as "working tree clean". */
+  const loadError = ref<string | null>(null)
+
   async function loadStatus() {
     if (props.sessionId.startsWith('pending-')) return
     loading.value = true
+    loadError.value = null
     try {
       const result = await api.get<{ branch: string; files: GitFile[] }>(`/sessions/${props.sessionId}/git/status`)
       currentBranch.value = result.branch
       files.value = result.files
-    } catch {
+    } catch (e) {
       currentBranch.value = ''
       files.value = []
+      loadError.value = (e as Error).message
     } finally {
       loading.value = false
     }
@@ -64,10 +71,12 @@
 
   async function loadLog() {
     loading.value = true
+    loadError.value = null
     try {
       commits.value = await api.get<GitCommit[]>(`/sessions/${props.sessionId}/git/log?limit=30`)
-    } catch {
+    } catch (e) {
       commits.value = []
+      loadError.value = (e as Error).message
     } finally {
       loading.value = false
     }
@@ -75,10 +84,12 @@
 
   async function loadBranches() {
     loading.value = true
+    loadError.value = null
     try {
       branches.value = await api.get<GitBranch[]>(`/sessions/${props.sessionId}/git/branches`)
-    } catch {
+    } catch (e) {
       branches.value = []
+      loadError.value = (e as Error).message
     } finally {
       loading.value = false
     }
@@ -99,8 +110,9 @@
       const result = await api.get<{ diff: string }>(`/sessions/${props.sessionId}/git/diff`)
       diff.value = result.diff
       showDiff.value = true
-    } catch {
+    } catch (e) {
       diff.value = ''
+      message.error(`读取 diff 失败: ${(e as Error).message}`)
     }
   }
 
@@ -155,10 +167,14 @@
 
       <!-- Status view -->
       <template v-else-if="activeView === 'status' && !showDiff">
-        <div v-if="files.length === 0" class="p-4">
-          <n-empty description="工作区干净" size="small" />
-        </div>
-        <template v-else>
+        <load-state
+          :loading="loading"
+          :error="loadError"
+          :empty="files.length === 0"
+          empty-text="工作区干净"
+          size="small"
+          @retry="loadStatus"
+        >
           <div class="flex items-center justify-between border-b border-om-border px-3 py-1.5">
             <span class="text-xs text-om-dimmed">{{ files.length }} 个文件变更</span>
             <n-button size="tiny" quaternary @click="loadDiff">查看 Diff</n-button>
@@ -173,7 +189,7 @@
             </n-tag>
             <span class="flex-1 truncate font-mono">{{ file.file }}</span>
           </div>
-        </template>
+        </load-state>
       </template>
 
       <!-- Diff view -->
@@ -198,39 +214,55 @@
 
       <!-- Log view -->
       <template v-else-if="activeView === 'log'">
-        <div v-if="commits.length === 0" class="p-4">
-          <n-empty description="无提交记录" size="small" />
-        </div>
-        <div v-for="commit in commits" :key="commit.hash" class="border-b border-om-border px-3 py-2 hover:bg-om-hover">
-          <div class="flex items-center gap-2">
-            <span class="text-xs text-om-primary font-mono">{{ commit.shortHash }}</span>
-            <span class="flex-1 truncate text-xs">{{ commit.message }}</span>
+        <load-state
+          :loading="loading"
+          :error="loadError"
+          :empty="commits.length === 0"
+          empty-text="无提交记录"
+          size="small"
+          @retry="loadLog"
+        >
+          <div
+            v-for="commit in commits"
+            :key="commit.hash"
+            class="border-b border-om-border px-3 py-2 hover:bg-om-hover"
+          >
+            <div class="flex items-center gap-2">
+              <span class="text-xs text-om-primary font-mono">{{ commit.shortHash }}</span>
+              <span class="flex-1 truncate text-xs">{{ commit.message }}</span>
+            </div>
+            <div class="mt-0.5 flex items-center gap-2 text-xs text-om-dimmed">
+              <span>{{ commit.author }}</span>
+              <span>{{ commit.relativeDate }}</span>
+              <n-tag v-if="commit.refs" size="small" type="warning">{{ commit.refs }}</n-tag>
+            </div>
           </div>
-          <div class="mt-0.5 flex items-center gap-2 text-xs text-om-dimmed">
-            <span>{{ commit.author }}</span>
-            <span>{{ commit.relativeDate }}</span>
-            <n-tag v-if="commit.refs" size="small" type="warning">{{ commit.refs }}</n-tag>
-          </div>
-        </div>
+        </load-state>
       </template>
 
       <!-- Branches view -->
       <template v-else-if="activeView === 'branches'">
-        <div v-if="branches.length === 0" class="p-4">
-          <n-empty description="无分支" size="small" />
-        </div>
-        <div
-          v-for="branch in branches"
-          :key="branch.name"
-          class="flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-om-hover"
+        <load-state
+          :loading="loading"
+          :error="loadError"
+          :empty="branches.length === 0"
+          empty-text="无分支"
+          size="small"
+          @retry="loadBranches"
         >
-          <i
-            :class="branch.current ? 'i-ri:checkbox-circle-fill text-om-success' : 'i-ri:git-branch-line'"
-            style="display: inline-block; width: 14px; height: 14px"
-          />
-          <span :class="{ 'font-bold text-om-primary': branch.current }">{{ branch.name }}</span>
-          <span v-if="branch.upstream" class="text-om-dimmed">→ {{ branch.upstream }}</span>
-        </div>
+          <div
+            v-for="branch in branches"
+            :key="branch.name"
+            class="flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-om-hover"
+          >
+            <i
+              :class="branch.current ? 'i-ri:checkbox-circle-fill text-om-success' : 'i-ri:git-branch-line'"
+              style="display: inline-block; width: 14px; height: 14px"
+            />
+            <span :class="{ 'font-bold text-om-primary': branch.current }">{{ branch.name }}</span>
+            <span v-if="branch.upstream" class="text-om-dimmed">→ {{ branch.upstream }}</span>
+          </div>
+        </load-state>
       </template>
     </div>
   </div>

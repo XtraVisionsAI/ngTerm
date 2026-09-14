@@ -21,6 +21,7 @@
   } from 'naive-ui'
   import { computed, h, onMounted, ref, watch } from 'vue'
   import { useRoute, useRouter } from 'vue-router'
+  import LoadState from '@/components/load-state.vue'
   import { useApi } from '@/composables/useApi'
   import { useAuthStore } from '@/stores/auth'
   import { actorKindLabel, evidenceLabel, exitLabel, kindLabel, sourceLabel, statusInfo } from '@/utils/audit'
@@ -67,14 +68,16 @@
     return params
   }
 
+  const loadError = ref<string | null>(null)
   async function load() {
     loading.value = true
+    loadError.value = null
     try {
       const data = await api.get<{ items: OperationRecord[]; total: number }>(`/audit/operations?${buildParams(true)}`)
       items.value = data.items
       total.value = data.total
     } catch (e) {
-      message.error((e as Error).message)
+      loadError.value = (e as Error).message
     } finally {
       loading.value = false
     }
@@ -295,10 +298,13 @@
       操作）以及用户、服务器、密钥、工具与配置的变更；人工终端键入不在此列，请查看会话录像。
     </p>
 
-    <div v-if="!loading && items.length === 0" class="flex flex-1 items-center justify-center">
-      <n-empty description="没有匹配的操作记录" />
-    </div>
-    <template v-else>
+    <load-state
+      :loading="loading"
+      :error="loadError"
+      :empty="items.length === 0"
+      empty-text="没有匹配的操作记录"
+      @retry="load"
+    >
       <n-data-table
         :columns="columns"
         :data="items"
@@ -318,7 +324,7 @@
           size="small"
         />
       </n-space>
-    </template>
+    </load-state>
 
     <n-drawer v-model:show="detailOpen" :width="680" placement="right">
       <n-drawer-content v-if="detail" title="操作详情" closable>
