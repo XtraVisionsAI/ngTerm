@@ -153,3 +153,51 @@ export function defaultParams(def: Definition): Record<string, unknown> {
   }
   return out
 }
+
+export type NotifyOn = 'always' | 'failure' | 'never'
+
+export interface Schedule {
+  scheduleId: string
+  flowId: string
+  flowVersion: number
+  name: string
+  userId: string
+  params: Record<string, string>
+  serverIds: string[]
+  concurrency: number
+  intervalSecs: number
+  enabled: boolean
+  notifyOn: NotifyOn
+  createdAt: string
+  updatedAt: string
+  nextRunAt: string
+  lastRunAt: string | null
+  lastBatchId: string | null
+  lastStatus: string | null
+}
+
+/** Human interval like "每 30 分钟" / "每 2 小时" / "每 1 天". */
+export function intervalLabel(secs: number): string {
+  if (secs % 86400 === 0) return `每 ${secs / 86400} 天`
+  if (secs % 3600 === 0) return `每 ${secs / 3600} 小时`
+  if (secs % 60 === 0) return `每 ${secs / 60} 分钟`
+  return `每 ${secs} 秒`
+}
+
+/** Preset intervals offered in the schedule form. */
+export const intervalOptions: { label: string; value: number }[] = [
+  { label: '每 5 分钟', value: 300 },
+  { label: '每 15 分钟', value: 900 },
+  { label: '每 30 分钟', value: 1800 },
+  { label: '每小时', value: 3600 },
+  { label: '每 6 小时', value: 21600 },
+  { label: '每 12 小时', value: 43200 },
+  { label: '每天', value: 86400 },
+  { label: '每周', value: 604800 }
+]
+
+export const notifyOnLabel: Record<NotifyOn, string> = {
+  always: '每次都通知',
+  failure: '仅失败时通知',
+  never: '不通知'
+}

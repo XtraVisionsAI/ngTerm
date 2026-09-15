@@ -37,6 +37,8 @@ export const useFeaturesStore = defineStore('features', () => {
   const approvals = computed(() => has('approvals'))
   const tasks = computed(() => has('tasks'))
   const flows = computed(() => has('flows'))
+  const schedules = computed(() => has('schedules'))
+  const notifications = computed(() => has('notifications'))
 
-  return { features, loaded, load, has, approvals, tasks, flows }
+  return { features, loaded, load, has, approvals, tasks, flows, schedules, notifications }
 })

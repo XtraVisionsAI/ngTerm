@@ -26,11 +26,13 @@
   import { computed, h, onMounted, ref, watch } from 'vue'
   import BatchPanel from '@/components/flow-batch-panel.vue'
   import RunView from '@/components/flow-run-view.vue'
+  import SchedulePanel from '@/components/flow-schedule-panel.vue'
   import JsonEditor from '@/components/json-editor.vue'
   import LoadState from '@/components/load-state.vue'
   import { useApi } from '@/composables/useApi'
   import { postWithAdmission } from '@/composables/useSessionAdmission'
   import { useAuthStore } from '@/stores/auth'
+  import { useFeaturesStore } from '@/stores/features'
   import { useSessionStore } from '@/stores/session'
   import { batchEligible, batchStatusInfo, defaultParams, runStatusInfo } from '@/utils/flows'
   import { formatTime } from '@/utils/format'
@@ -38,6 +40,7 @@
   const api = useApi()
   const message = useMessage()
   const auth = useAuthStore()
+  const features = useFeaturesStore()
   const sessionStore = useSessionStore()
 
   // --- flows ---
@@ -71,7 +74,7 @@
   )
 
   /** Single session or batch across servers (read-only flows only). */
-  const mode = ref<'single' | 'batch'>('single')
+  const mode = ref<'single' | 'batch' | 'schedule'>('single')
 
   function selectFlow(f: Flow) {
     selected.value = f
@@ -401,10 +404,18 @@
             <n-button size="tiny" :type="mode === 'batch' ? 'primary' : 'default'" quaternary @click="mode = 'batch'"
               >批量执行</n-button
             >
+            <n-button
+              v-if="features.schedules"
+              size="tiny"
+              :type="mode === 'schedule' ? 'primary' : 'default'"
+              quaternary
+              @click="mode = 'schedule'"
+              >定时任务</n-button
+            >
           </div>
 
-          <!-- Batch -->
-          <template v-if="!run && mode === 'batch'">
+          <!-- Batch / schedule share the parameter form -->
+          <template v-if="!run && (mode === 'batch' || mode === 'schedule')">
             <div class="mb-2 border border-om-border rounded p-3">
               <div v-for="p in selected.definition.params" :key="p.key" class="mb-2 flex items-center gap-2">
                 <span class="w-24 truncate text-xs text-om-dimmed"
@@ -441,7 +452,8 @@
               </div>
               <div v-if="!selected.definition.params.length" class="text-xs text-om-dimmed">此流程没有参数</div>
             </div>
-            <batch-panel :flow="selected" :params="params" />
+            <batch-panel v-if="mode === 'batch'" :flow="selected" :params="params" />
+            <schedule-panel v-else :flow="selected" :params="params" />
           </template>
 
           <!-- Setup -->

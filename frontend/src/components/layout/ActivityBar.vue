@@ -1,9 +1,12 @@
 <script setup lang="ts">
+  import { NDrawer, NDrawerContent } from 'naive-ui'
   import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
   import { useRoute, useRouter } from 'vue-router'
+  import NotificationsInbox from '@/components/notifications-inbox.vue'
   import { useApi } from '@/composables/useApi'
   import { useAuthStore } from '@/stores/auth'
   import { useFeaturesStore } from '@/stores/features'
+  import { useNotificationsStore } from '@/stores/notifications'
 
   const activeKey = defineModel<string>('activePanel')
 
@@ -20,6 +23,8 @@
   const features = useFeaturesStore()
   const api = useApi()
   const route = useRoute()
+  const notifications = useNotificationsStore()
+  const showNotifications = ref(false)
 
   interface ActivityItem {
     icon: string
@@ -76,11 +81,18 @@
   onMounted(async () => {
     await features.load()
     if (features.approvals) startInboxPolling()
+    if (features.notifications) notifications.startPolling()
   })
   watch(
     () => features.approvals,
     (on) => {
       if (on) startInboxPolling()
+    }
+  )
+  watch(
+    () => features.notifications,
+    (on) => {
+      if (on) notifications.startPolling()
     }
   )
   // Landing on the approvals page means the person just looked at the inbox.
@@ -92,7 +104,14 @@
   )
   onBeforeUnmount(() => {
     if (inboxTimer) clearInterval(inboxTimer)
+    notifications.stopPolling()
   })
+
+  function openNotifications() {
+    showNotifications.value = true
+    notifications.load()
+    notifications.refreshUnread()
+  }
 
   function handleClick(item: ActivityItem) {
     if (item.key.startsWith('/')) {
@@ -139,11 +158,29 @@
       </button>
     </div>
     <div class="activity-bottom">
+      <button
+        v-if="features.notifications"
+        title="通知"
+        class="activity-item"
+        :class="{ active: showNotifications }"
+        @click="openNotifications"
+      >
+        <i class="i-ri:notification-3-line activity-icon" />
+        <span v-if="notifications.unread > 0" class="activity-badge">
+          {{ notifications.unread > 99 ? '99+' : notifications.unread }}
+        </span>
+      </button>
       <button title="退出登录" class="activity-item" @click="handleLogout">
         <i class="i-ri:logout-box-r-line activity-icon" />
       </button>
     </div>
   </div>
+
+  <n-drawer v-model:show="showNotifications" :width="380" placement="right">
+    <n-drawer-content title="通知" closable :native-scrollbar="false">
+      <notifications-inbox @close="showNotifications = false" />
+    </n-drawer-content>
+  </n-drawer>
 </template>
 
 <style scoped>
