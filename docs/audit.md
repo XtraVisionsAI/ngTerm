@@ -204,5 +204,28 @@ except through the recorded intent. Refused and blocked actions never start,
 so they leave no `running` operation behind; a denied managed operation is
 recorded with status `denied` and the reason.
 
-## Planned, not yet implemented
+## File-write evidence
 
+A managed file write (`PUT /api/sessions/{id}/files/content`, and the same
+path used by distributions' agents) records, on its operation, the baseline
+it started from (`file.baseline`: path, existence, size, sha256, whether the
+content was text and whether it was too large to hash), the backup it made
+of the previous content (`file.backup`: `<dir>/.<name>.ngterm-bak-<stamp>`),
+and the read-back check after writing (`file.verified` with the sha256, or
+`file.verify_failed` with expected/actual). A write whose caller names a
+`baselineSha256` that no longer matches is refused with 409 and nothing is
+written. `POST /api/sessions/{id}/files/restore` puts a backup back through
+the same verified path, so a restore is itself an audited, verified write.
+
+## Distributions
+
+Records written by a distribution's own channels (an in-process agent
+engine, a controlled command API, operations flows) use the same tables,
+statuses and evidence rules as the core channels: every command is an
+operation with a recorded intent, `task_id` links the operations of one
+agent run or flow run, `parent_operation_id` links a command to the tool
+call that caused it, and output is attached as `command.output` events
+(redacted, capped). Approval decisions taken before an operation ran are the
+distribution's own records and are referenced from the operation, not
+duplicated into it. This document describes the core; the enterprise
+edition's approval model is documented in its own repository.

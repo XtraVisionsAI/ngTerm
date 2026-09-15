@@ -23,11 +23,12 @@ NGTerm is a single-binary SSH gateway that sits on your jump host and provides b
 
 ## Features
 
-- **AI Agent Integration** — launch CLI agents (e.g. Claude Code) against any session: streaming chat UI, tool-call rendering, and execution approval, auto-installed on the target over SSH
+- **AI Agent Integration** — launch CLI agents (e.g. Claude Code) against any session: streaming chat UI, tool-call rendering, and execution approval, auto-installed on the target over SSH. Terminal selections, files and Git diffs can be added to the agent's context; the text is redacted and reviewed before it is sent
 - **Jump-Host Relay** — deploy on a gateway server, SSH into internal machines; users only need browser access to one endpoint
 - **Encrypted Key Storage** — per-user SSH keys encrypted with AES-256-GCM in SQLite; only the owner's password can unlock them, even the admin cannot
 - **Multi-Tab & Split Panes** — multiple servers in labeled tabs; split any terminal horizontally/vertically (Ctrl+Shift+D/E/W), layout survives page refresh
-- **File Explorer (SFTP)** — browse, upload, download, and edit remote files from the browser
+- **File Explorer (SFTP)** — browse, upload, download, and edit remote files from the browser; edits are bound to the baseline they were made from (409 on a concurrent change), backed up before writing and verified by reading back; folder bookmarks per server
+- **Connection Efficiency** — import a safe subset of `~/.ssh/config` (with a preview of what is skipped and why), favourites, environment tags (`env:prod` and friends), server search
 - **Git Panel** — status, log, branches, and diff for repositories on the remote machine
 - **Audit & Recording** — every session is recorded (output, resizes, input metadata) in hashed, append-only chunks; platform-executed file/git/config operations are registered before they run and closed with a truthful outcome; search, export and replay with per-user scoping. See [docs/audit.md](docs/audit.md)
 - **Admin Terminal** — local shell on the jump host for administrators, with the same split-pane experience
@@ -36,7 +37,9 @@ NGTerm is a single-binary SSH gateway that sits on your jump host and provides b
 
 ## NGTerm EE
 
-The open-source edition integrates external CLI agents. **NGTerm EE** (enterprise edition) additionally ships a built-in agent engine that runs inside the server process — LLM-driven ReAct loop (Anthropic / OpenAI-compatible), server-side risk classification and command denylists, MCP tool servers, and reusable skills. The tool type selector in the admin UI includes a **"Native Engine"** option: it is part of the shared UI, and starting a native tool on the open-source backend returns *"Native engine tools require NGTerm EE"*. Everything else in this repository is fully functional standalone.
+The open-source edition integrates external CLI agents. **NGTerm EE** (enterprise edition) additionally ships a built-in agent engine that runs inside the server process — LLM-driven ReAct loop (Anthropic / OpenAI-compatible), server-side risk classification and command denylists, MCP tool servers, reusable skills — plus second-person approval, a controlled command channel, a persistent task center and parameterised operations flows, all on top of this repository's audit store. The tool type selector in the admin UI includes a **"Native Engine"** option: it is part of the shared UI, and starting a native tool on the open-source backend returns *"Native engine tools require NGTerm EE"*. Screens for enterprise features appear only when the backend advertises them through `GET /api/features`. Everything else in this repository is fully functional standalone.
+
+This repository exposes neutral extension points and carries no enterprise logic: `ExecutionGuard` (asked before a session is opened on a user's behalf or a managed operation starts; answers proceed / refuse / await approval), `RouterHooks` (replace the agent start handler, mount extra routes under `/api`, advertise features) and the audit outlet every managed operation is recorded through. See [docs/audit.md](docs/audit.md), section "Pre-execution check hook".
 
 ## Architecture
 
