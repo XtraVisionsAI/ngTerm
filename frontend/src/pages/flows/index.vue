@@ -6,7 +6,7 @@
    * evidence of each step. Admins edit definitions as JSON (version + 1).
    */
   import type { DataTableColumns } from 'naive-ui'
-  import type { Flow, Run } from '@/utils/flows'
+  import type { Batch, Flow, Run } from '@/utils/flows'
   import {
     NButton,
     NCheckbox,
@@ -24,6 +24,7 @@
     useMessage
   } from 'naive-ui'
   import { computed, h, onMounted, ref, watch } from 'vue'
+  import BatchPanel from '@/components/flow-batch-panel.vue'
   import RunView from '@/components/flow-run-view.vue'
   import JsonEditor from '@/components/json-editor.vue'
   import LoadState from '@/components/load-state.vue'
@@ -31,7 +32,7 @@
   import { postWithAdmission } from '@/composables/useSessionAdmission'
   import { useAuthStore } from '@/stores/auth'
   import { useSessionStore } from '@/stores/session'
-  import { defaultParams, runStatusInfo } from '@/utils/flows'
+  import { batchEligible, batchStatusInfo, defaultParams, runStatusInfo } from '@/utils/flows'
   import { formatTime } from '@/utils/format'
 
   const api = useApi()
@@ -69,10 +70,14 @@
       .map((t) => ({ label: `${t.serverAlias} · ${t.id.slice(0, 8)}`, value: t.id }))
   )
 
+  /** Single session or batch across servers (read-only flows only). */
+  const mode = ref<'single' | 'batch'>('single')
+
   function selectFlow(f: Flow) {
     selected.value = f
     params.value = defaultParams(f.definition)
     run.value = null
+    if (!batchEligible(f.definition)) mode.value = 'single'
   }
 
   // --- run execution ---
@@ -142,15 +147,30 @@
 
   // --- history ---
   const runs = ref<Run[]>([])
+  const batches = ref<Batch[]>([])
   const loadingRuns = ref(false)
   const showHistory = ref(false)
   const historyRun = ref<Run | null>(null)
+  const historyBatch = ref<{ batch: Batch; runs: Run[] } | null>(null)
+
+  async function openBatch(b: Batch) {
+    try {
+      historyBatch.value = await api.get<{ batch: Batch; runs: Run[] }>(`/flow-batches/${b.batchId}`)
+    } catch (e) {
+      message.error((e as Error).message)
+    }
+  }
 
   async function loadRuns() {
     loadingRuns.value = true
     try {
       const q = selected.value ? `?flowId=${selected.value.flowId}&limit=50` : '?limit=50'
-      runs.value = (await api.get<{ items: Run[] }>(`/flow-runs${q}`)).items
+      const [r, b] = await Promise.all([
+        api.get<{ items: Run[] }>(`/flow-runs${q}`),
+        api.get<{ items: Batch[] }>('/flow-batches?limit=50')
+      ])
+      runs.value = r.items
+      batches.value = selected.value ? b.items.filter((x) => x.flowId === selected.value!.flowId) : b.items
     } catch (e) {
       message.error((e as Error).message)
     } finally {
@@ -180,6 +200,29 @@
       key: 'open',
       width: 70,
       render: (r) => h(NButton, { size: 'tiny', quaternary: true, onClick: () => (historyRun.value = r) }, () => '详情')
+    }
+  ])
+
+  const batchColumns = computed<DataTableColumns<Batch>>(() => [
+    { title: '流程', key: 'flowName', width: 140, render: (b) => `${b.flowName} v${b.flowVersion}` },
+    {
+      title: '状态',
+      key: 'status',
+      width: 100,
+      render: (b) =>
+        h(NTag, { size: 'small', type: batchStatusInfo[b.status].type }, () => batchStatusInfo[b.status].label)
+    },
+    {
+      title: '结果',
+      key: 'counts',
+      render: (b) => `${b.total} 台 · 成功 ${b.succeeded} · 失败 ${b.failed} · 跳过 ${b.skipped}`
+    },
+    { title: '开始', key: 'startedAt', width: 150, render: (b) => formatTime(b.startedAt) },
+    {
+      title: '',
+      key: 'open',
+      width: 70,
+      render: (b) => h(NButton, { size: 'tiny', quaternary: true, onClick: () => openBatch(b) }, () => '详情')
     }
   ])
 
@@ -350,8 +393,59 @@
             </div>
           </div>
 
+          <div v-if="!run && batchEligible(selected.definition)" class="mb-2 flex items-center gap-2 text-xs">
+            <n-tag size="tiny" type="success" :bordered="false">只读流程</n-tag>
+            <n-button size="tiny" :type="mode === 'single' ? 'primary' : 'default'" quaternary @click="mode = 'single'"
+              >单台会话</n-button
+            >
+            <n-button size="tiny" :type="mode === 'batch' ? 'primary' : 'default'" quaternary @click="mode = 'batch'"
+              >批量执行</n-button
+            >
+          </div>
+
+          <!-- Batch -->
+          <template v-if="!run && mode === 'batch'">
+            <div class="mb-2 border border-om-border rounded p-3">
+              <div v-for="p in selected.definition.params" :key="p.key" class="mb-2 flex items-center gap-2">
+                <span class="w-24 truncate text-xs text-om-dimmed"
+                  >{{ p.label || p.key }}<span v-if="p.required" class="text-om-danger">*</span></span
+                >
+                <n-input-number
+                  v-if="p.type === 'int'"
+                  :value="(params[p.key] as number | null) ?? null"
+                  size="small"
+                  style="width: 200px"
+                  @update:value="(v: number | null) => (params[p.key] = v)"
+                />
+                <n-checkbox
+                  v-else-if="p.type === 'bool'"
+                  :checked="!!params[p.key]"
+                  size="small"
+                  @update:checked="(v: boolean) => (params[p.key] = v)"
+                />
+                <n-select
+                  v-else-if="p.type === 'enum'"
+                  :value="(params[p.key] as string | null) ?? null"
+                  :options="p.options.map((o) => ({ label: o, value: o }))"
+                  size="small"
+                  style="width: 240px"
+                  @update:value="(v: string | null) => (params[p.key] = v)"
+                />
+                <n-input
+                  v-else
+                  :value="(params[p.key] as string | null) ?? ''"
+                  size="small"
+                  style="width: 320px"
+                  @update:value="(v: string) => (params[p.key] = v)"
+                />
+              </div>
+              <div v-if="!selected.definition.params.length" class="text-xs text-om-dimmed">此流程没有参数</div>
+            </div>
+            <batch-panel :flow="selected" :params="params" />
+          </template>
+
           <!-- Setup -->
-          <div v-if="!run" class="border border-om-border rounded p-3">
+          <div v-else-if="!run" class="border border-om-border rounded p-3">
             <div class="mb-2 flex items-center gap-2">
               <span class="w-24 text-xs text-om-dimmed">目标会话</span>
               <n-select
@@ -411,7 +505,7 @@
           </div>
 
           <!-- Run progress -->
-          <run-view v-else :run="run">
+          <run-view v-else-if="run" :run="run">
             <template #actions>
               <n-space size="small" align="center">
                 <template v-if="run.status === 'ready' && nextStepDef">
@@ -441,8 +535,52 @@
           :bordered="false"
           :row-key="(r: Run) => r.runId"
         />
+        <div class="mb-1 mt-3 text-xs text-om-dimmed">批量执行历史</div>
+        <n-data-table
+          :columns="batchColumns"
+          :data="batches"
+          :loading="loadingRuns"
+          size="small"
+          :bordered="false"
+          :row-key="(b: Batch) => b.batchId"
+        />
       </div>
     </div>
+
+    <n-drawer
+      :show="!!historyBatch"
+      :width="760"
+      placement="right"
+      @update:show="(v: boolean) => !v && (historyBatch = null)"
+    >
+      <n-drawer-content
+        v-if="historyBatch"
+        :title="`批量 · ${historyBatch.batch.flowName} v${historyBatch.batch.flowVersion} · ${historyBatch.batch.total} 台`"
+        closable
+        :native-scrollbar="false"
+      >
+        <div class="mb-2 text-xs">
+          <n-tag size="small" :type="batchStatusInfo[historyBatch.batch.status].type">{{
+            batchStatusInfo[historyBatch.batch.status].label
+          }}</n-tag>
+          <span class="ml-2"
+            >成功 {{ historyBatch.batch.succeeded }} · 失败 {{ historyBatch.batch.failed }} · 跳过
+            {{ historyBatch.batch.skipped }}</span
+          >
+          <span v-if="Object.keys(historyBatch.batch.params).length" class="ml-2 text-om-dimmed font-mono">
+            {{
+              Object.entries(historyBatch.batch.params)
+                .map(([k, v]) => `${k}=${v}`)
+                .join(' ')
+            }}
+          </span>
+        </div>
+        <div v-for="r in historyBatch.runs" :key="r.runId" class="mb-3">
+          <div class="mb-1 text-sm font-semibold">{{ r.serverAlias || r.serverId }}</div>
+          <run-view :run="r" />
+        </div>
+      </n-drawer-content>
+    </n-drawer>
 
     <n-drawer
       :show="!!historyRun"

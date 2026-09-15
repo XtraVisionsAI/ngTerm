@@ -24,6 +24,7 @@ declare module 'vue' {
     ControlledCommandPanel: typeof import('./../../src/components/controlled-command-panel.vue')['default']
     CredentialList: typeof import('./../../src/components/sidebar/CredentialList.vue')['default']
     FileExplorer: typeof import('./../../src/components/file-explorer/FileExplorer.vue')['default']
+    FlowBatchPanel: typeof import('./../../src/components/flow-batch-panel.vue')['default']
     FlowRunView: typeof import('./../../src/components/flow-run-view.vue')['default']
     GitPanel: typeof import('./../../src/components/git-panel.vue')['default']
     JsonEditor: typeof import('./../../src/components/json-editor.vue')['default']

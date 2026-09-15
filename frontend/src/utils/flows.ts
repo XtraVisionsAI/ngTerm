@@ -40,6 +40,7 @@ export interface Definition {
   preChecks: Check[]
   steps: Step[]
   cwd?: string | null
+  readOnly?: boolean
 }
 
 export interface Flow {
@@ -77,10 +78,11 @@ export interface StepResult {
   finishedAt: string
 }
 
-export type RunStatus = 'ready' | 'precheck_failed' | 'finished' | 'failed' | 'aborted'
+export type RunStatus = 'ready' | 'precheck_failed' | 'finished' | 'failed' | 'aborted' | 'skipped'
 
 export interface Run {
   runId: string
+  batchId: string | null
   flowId: string
   flowName: string
   flowVersion: number
@@ -105,7 +107,40 @@ export const runStatusInfo: Record<RunStatus, { label: string; type: TagType }> 
   precheck_failed: { label: '前置检查未通过', type: 'warning' },
   finished: { label: '已完成', type: 'success' },
   failed: { label: '失败', type: 'error' },
-  aborted: { label: '已中止', type: 'default' }
+  aborted: { label: '已中止', type: 'default' },
+  skipped: { label: '已跳过', type: 'warning' }
+}
+
+export type BatchStatus = 'running' | 'finished' | 'cancelled'
+
+export interface Batch {
+  batchId: string
+  flowId: string
+  flowName: string
+  flowVersion: number
+  userId: string
+  params: Record<string, string>
+  serverIds: string[]
+  concurrency: number
+  status: BatchStatus
+  total: number
+  succeeded: number
+  failed: number
+  skipped: number
+  startedAt: string
+  updatedAt: string
+  finishedAt: string | null
+}
+
+export const batchStatusInfo: Record<BatchStatus, { label: string; type: TagType }> = {
+  running: { label: '执行中', type: 'info' },
+  finished: { label: '已完成', type: 'success' },
+  cancelled: { label: '已取消', type: 'default' }
+}
+
+/** Whether a flow may run across many servers at once. */
+export function batchEligible(def: Definition): boolean {
+  return !!def.readOnly && !def.steps.some((s) => s.approval === 'required')
 }
 
 /** Initial form values from a definition's defaults. */
